@@ -1,0 +1,14 @@
+# Fuck you Disyer. Stealing my fucking paypal. GET FUCKED: toontown.hood.MMHood
+from toontown.safezone.MMSafeZoneLoader import MMSafeZoneLoader
+from toontown.town.MMTownLoader import MMTownLoader
+from toontown.toonbase import ToontownGlobals
+from toontown.hood.ToonHood import ToonHood
+
+class MMHood(ToonHood):
+    notify = directNotify.newCategory('MMHood')
+    ID = ToontownGlobals.MinniesMelodyland
+    TOWNLOADER_CLASS = MMTownLoader
+    SAFEZONELOADER_CLASS = MMSafeZoneLoader
+    SKY_FILE = 'phase_6/models/props/MM_sky'
+    SPOOKY_SKY_FILE = 'phase_6/models/props/MM_sky'
+    TITLE_COLOR = (1.0, 0.5, 0.5, 1.0)
