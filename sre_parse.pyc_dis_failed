@@ -1,0 +1,2447 @@
+# Fuck you Disyer. Stealing my fucking paypal. GET FUCKED: sre_parse
+import sys
+from sre_constants import *
+SPECIAL_CHARS = '.\\[{()*+?^$|'
+REPEAT_CHARS = '*+?{'
+DIGITS = set('0123456789')
+OCTDIGITS = set('01234567')
+HEXDIGITS = set('0123456789abcdefABCDEF')
+WHITESPACE = set(' \t\n\r\x0b\x0c')
+ESCAPES = {'\\a': (LITERAL, ord('\x07')),
+ '\\b': (LITERAL, ord('\x08')),
+ '\\f': (LITERAL, ord('\x0c')),
+ '\\n': (LITERAL, ord('\n')),
+ '\\r': (LITERAL, ord('\r')),
+ '\\t': (LITERAL, ord('\t')),
+ '\\v': (LITERAL, ord('\x0b')),
+ '\\\\': (LITERAL, ord('\\'))}
+CATEGORIES = {'\\A': (AT, AT_BEGINNING_STRING),
+ '\\b': (AT, AT_BOUNDARY),
+ '\\B': (AT, AT_NON_BOUNDARY),
+ '\\d': (IN, [(CATEGORY, CATEGORY_DIGIT)]),
+ '\\D': (IN, [(CATEGORY, CATEGORY_NOT_DIGIT)]),
+ '\\s': (IN, [(CATEGORY, CATEGORY_SPACE)]),
+ '\\S': (IN, [(CATEGORY, CATEGORY_NOT_SPACE)]),
+ '\\w': (IN, [(CATEGORY, CATEGORY_WORD)]),
+ '\\W': (IN, [(CATEGORY, CATEGORY_NOT_WORD)]),
+ '\\Z': (AT, AT_END_STRING)}
+FLAGS = {'i': SRE_FLAG_IGNORECASE,
+ 'L': SRE_FLAG_LOCALE,
+ 'm': SRE_FLAG_MULTILINE,
+ 's': SRE_FLAG_DOTALL,
+ 'x': SRE_FLAG_VERBOSE,
+ 't': SRE_FLAG_TEMPLATE,
+ 'u': SRE_FLAG_UNICODE}
+
+class Pattern():
+
+    def __init__(self):
+        self.flags = 0
+        self.open = []
+        self.groups = 1
+        self.groupdict = {}
+
+    def opengroup(self, name = None):
+        gid = self.groups
+        self.groups = gid + 1
+        if name is not None:
+            ogid = self.groupdict.get(name, None)
+            if ogid is not None:
+                raise error, 'redefinition of group name %s as group %d; was group %d' % (repr(name), gid, ogid)
+            self.groupdict[name] = gid
+        self.open.append(gid)
+        return gid
+
+    def closegroup(self, gid):
+        self.open.remove(gid)
+
+    def checkgroup(self, gid):
+        return gid < self.groups and gid not in self.open
+
+
+class SubPattern():
+
+    def __init__(self, pattern, data = None):
+        self.pattern = pattern
+        if data is None:
+            data = []
+        self.data = data
+        self.width = None
+        return
+
+    def dump(self, level = 0):
+        seqtypes = (tuple, list)
+        for op, av in self.data:
+            print level * '  ' + op,
+            if op == IN:
+                print
+                for op, a in av:
+                    print (level + 1) * '  ' + op, a
+
+            elif op == BRANCH:
+                print
+                for i, a in enumerate(av[1]):
+                    if i:
+                        print level * '  ' + 'or'
+                    a.dump(level + 1)
+
+            elif op == GROUPREF_EXISTS:
+                condgroup, item_yes, item_no = av
+                print condgroup
+                item_yes.dump(level + 1)
+                if item_no:
+                    print level * '  ' + 'else'
+                    item_no.dump(level + 1)
+            elif isinstance(av, seqtypes):
+                nl = 0
+                for a in av:
+                    if isinstance(a, SubPattern):
+                        if not nl:
+                            print
+                        a.dump(level + 1)
+                        nl = 1
+                    else:
+                        print a,
+                        nl = 0
+
+                if not nl:
+                    print
+            else:
+                print av
+
+    def __repr__(self):
+        return repr(self.data)
+
+    def __len__(self):
+        return len(self.data)
+
+    def __delitem__(self, index):
+        del self.data[index]
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return SubPattern(self.pattern, self.data[index])
+        return self.data[index]
+
+    def __setitem__(self, index, code):
+        self.data[index] = code
+
+    def insert(self, index, code):
+        self.data.insert(index, code)
+
+    def append(self, code):
+        self.data.append(code)
+
+    def getwidth(self):
+        if self.width:
+            return self.width
+        lo = hi = 0
+        UNITCODES = (ANY,
+         RANGE,
+         IN,
+         LITERAL,
+         NOT_LITERAL,
+         CATEGORY)
+        REPEATCODES = (MIN_REPEAT, MAX_REPEAT)
+        for op, av in self.data:
+            if op is BRANCH:
+                i = MAXREPEAT - 1
+                j = 0
+                for av in av[1]:
+                    l, h = av.getwidth()
+                    i = min(i, l)
+                    j = max(j, h)
+
+                lo = lo + i
+                hi = hi + j
+            elif op is CALL:
+                i, j = av.getwidth()
+                lo = lo + i
+                hi = hi + j
+            elif op is SUBPATTERN:
+                i, j = av[1].getwidth()
+                lo = lo + i
+                hi = hi + j
+            elif op in REPEATCODES:
+                i, j = av[2].getwidth()
+                lo = lo + i * av[0]
+                hi = hi + j * av[1]
+            elif op in UNITCODES:
+                lo = lo + 1
+                hi = hi + 1
+            elif op == SUCCESS:
+                break
+
+        self.width = (min(lo, MAXREPEAT - 1), min(hi, MAXREPEAT))
+        return self.width
+
+
+class Tokenizer():
+
+    def __init__(self, string):
+        self.string = string
+        self.index = 0
+        self.__next()
+
+    def __next(self):
+        if self.index >= len(self.string):
+            self.next = None
+            return
+        else:
+            char = self.string[self.index]
+            if char[0] == '\\':
+                try:
+                    c = self.string[self.index + 1]
+                except IndexError:
+                    raise error, 'bogus escape (end of line)'
+
+                char = char + c
+            self.index = self.index + len(char)
+            self.next = char
+            return
+
+    def match(self, char, skip = 1):
+        if char == self.next:
+            if skip:
+                self.__next()
+            return 1
+        return 0
+
+    def get(self):
+        this = self.next
+        self.__next()
+        return this
+
+    def tell(self):
+        return (self.index, self.next)
+
+    def seek(self, index):
+        self.index, self.next = index
+
+
+def isident(char):
+    return 'a' <= char <= 'z' or 'A' <= char <= 'Z' or char == '_'
+
+
+def isdigit(char):
+    return '0' <= char <= '9'
+
+
+def isname(name):
+    if not isident(name[0]):
+        return False
+    for char in name[1:]:
+        if not isident(char) and not isdigit(char):
+            return False
+
+    return True
+
+
+def _class_escape(source, escape):
+    code = ESCAPES.get(escape)
+    if code:
+        return code
+    code = CATEGORIES.get(escape)
+    if code and code[0] == IN:
+        return code
+    try:
+        c = escape[1:2]
+        if c == 'x':
+            while source.next in HEXDIGITS and len(escape) < 4:
+                escape = escape + source.get()
+
+            escape = escape[2:]
+            if len(escape) != 2:
+                raise error, 'bogus escape: %s' % repr('\\' + escape)
+            return (LITERAL, int(escape, 16) & 255)
+        if c in OCTDIGITS:
+            while source.next in OCTDIGITS and len(escape) < 4:
+                escape = escape + source.get()
+
+            escape = escape[1:]
+            return (LITERAL, int(escape, 8) & 255)
+        if c in DIGITS:
+            raise error, 'bogus escape: %s' % repr(escape)
+        if len(escape) == 2:
+            return (LITERAL, ord(escape[1]))
+    except ValueError:
+        pass
+
+    raise error, 'bogus escape: %s' % repr(escape)
+
+
+def _escape(source, escape, state):
+    code = CATEGORIES.get(escape)
+    if code:
+        return code
+    code = ESCAPES.get(escape)
+    if code:
+        return code
+    try:
+        c = escape[1:2]
+        if c == 'x':
+            while source.next in HEXDIGITS and len(escape) < 4:
+                escape = escape + source.get()
+
+            if len(escape) != 4:
+                raise ValueError
+            return (LITERAL, int(escape[2:], 16) & 255)
+        if c == '0':
+            while source.next in OCTDIGITS and len(escape) < 4:
+                escape = escape + source.get()
+
+            return (LITERAL, int(escape[1:], 8) & 255)
+        if c in DIGITS:
+            if source.next in DIGITS:
+                escape = escape + source.get()
+                if escape[1] in OCTDIGITS and escape[2] in OCTDIGITS and source.next in OCTDIGITS:
+                    escape = escape + source.get()
+                    return (LITERAL, int(escape[1:], 8) & 255)
+            group = int(escape[1:])
+            if group < state.groups:
+                if not state.checkgroup(group):
+                    raise error, 'cannot refer to open group'
+                return (GROUPREF, group)
+            raise ValueError
+        if len(escape) == 2:
+            return (LITERAL, ord(escape[1]))
+    except ValueError:
+        pass
+
+    raise error, 'bogus escape: %s' % repr(escape)
+
+
+def _parse_sub--- This code section failed: ---
+
+0	BUILD_LIST_0      None
+3	STORE_FAST        'items'
+
+6	LOAD_FAST         'items'
+9	LOAD_ATTR         'append'
+12	STORE_FAST        'itemsappend'
+
+15	LOAD_FAST         'source'
+18	LOAD_ATTR         'match'
+21	STORE_FAST        'sourcematch'
+
+24	SETUP_LOOP        '116'
+
+27	LOAD_FAST         'itemsappend'
+30	LOAD_GLOBAL       '_parse'
+33	LOAD_FAST         'source'
+36	LOAD_FAST         'state'
+39	CALL_FUNCTION_2   None
+42	CALL_FUNCTION_1   None
+45	POP_TOP           None
+
+46	LOAD_FAST         'sourcematch'
+49	LOAD_CONST        '|'
+52	CALL_FUNCTION_1   None
+55	POP_JUMP_IF_FALSE '64'
+
+58	CONTINUE          '27'
+61	JUMP_FORWARD      '64'
+64_0	COME_FROM         '61'
+
+64	LOAD_FAST         'nested'
+67	POP_JUMP_IF_TRUE  '74'
+
+70	BREAK_LOOP        None
+71	JUMP_FORWARD      '74'
+74_0	COME_FROM         '71'
+
+74	LOAD_FAST         'source'
+77	LOAD_ATTR         'next'
+80	UNARY_NOT         None
+81	POP_JUMP_IF_TRUE  '99'
+84	LOAD_FAST         'sourcematch'
+87	LOAD_CONST        ')'
+90	LOAD_CONST        0
+93	CALL_FUNCTION_2   None
+96_0	COME_FROM         '81'
+96	POP_JUMP_IF_FALSE '103'
+
+99	BREAK_LOOP        None
+100	JUMP_BACK         '27'
+
+103	LOAD_GLOBAL       'error'
+106	LOAD_CONST        'pattern not properly closed'
+109	RAISE_VARARGS_2   None
+112	JUMP_BACK         '27'
+115	POP_BLOCK         None
+116_0	COME_FROM         '24'
+
+116	LOAD_GLOBAL       'len'
+119	LOAD_FAST         'items'
+122	CALL_FUNCTION_1   None
+125	LOAD_CONST        1
+128	COMPARE_OP        '=='
+131	POP_JUMP_IF_FALSE '142'
+
+134	LOAD_FAST         'items'
+137	LOAD_CONST        0
+140	BINARY_SUBSCR     None
+141	RETURN_END_IF     None
+
+142	LOAD_GLOBAL       'SubPattern'
+145	LOAD_FAST         'state'
+148	CALL_FUNCTION_1   None
+151	STORE_FAST        'subpattern'
+
+154	LOAD_FAST         'subpattern'
+157	LOAD_ATTR         'append'
+160	STORE_FAST        'subpatternappend'
+
+163	SETUP_LOOP        '286'
+
+166	LOAD_CONST        None
+169	STORE_FAST        'prefix'
+
+172	SETUP_LOOP        '281'
+175	LOAD_FAST         'items'
+178	GET_ITER          None
+179	FOR_ITER          '243'
+182	STORE_FAST        'item'
+
+185	LOAD_FAST         'item'
+188	POP_JUMP_IF_TRUE  '195'
+
+191	BREAK_LOOP        None
+192	JUMP_FORWARD      '195'
+195_0	COME_FROM         '192'
+
+195	LOAD_FAST         'prefix'
+198	LOAD_CONST        None
+201	COMPARE_OP        'is'
+204	POP_JUMP_IF_FALSE '220'
+
+207	LOAD_FAST         'item'
+210	LOAD_CONST        0
+213	BINARY_SUBSCR     None
+214	STORE_FAST        'prefix'
+217	JUMP_BACK         '179'
+
+220	LOAD_FAST         'item'
+223	LOAD_CONST        0
+226	BINARY_SUBSCR     None
+227	LOAD_FAST         'prefix'
+230	COMPARE_OP        '!='
+233	POP_JUMP_IF_FALSE '179'
+
+236	BREAK_LOOP        None
+237	JUMP_BACK         '179'
+240	JUMP_BACK         '179'
+243	POP_BLOCK         None
+
+244	SETUP_LOOP        '268'
+247	LOAD_FAST         'items'
+250	GET_ITER          None
+251	FOR_ITER          '267'
+254	STORE_FAST        'item'
+
+257	LOAD_FAST         'item'
+260	LOAD_CONST        0
+263	DELETE_SUBSCR     None
+264	JUMP_BACK         '251'
+267	POP_BLOCK         None
+268_0	COME_FROM         '244'
+
+268	LOAD_FAST         'subpatternappend'
+271	LOAD_FAST         'prefix'
+274	CALL_FUNCTION_1   None
+277	POP_TOP           None
+
+278	CONTINUE          '166'
+281_0	COME_FROM         '172'
+
+281	BREAK_LOOP        None
+282	JUMP_BACK         '166'
+285	POP_BLOCK         None
+286_0	COME_FROM         '163'
+
+286	SETUP_LOOP        '411'
+289	LOAD_FAST         'items'
+292	GET_ITER          None
+293	FOR_ITER          '344'
+296	STORE_FAST        'item'
+
+299	LOAD_GLOBAL       'len'
+302	LOAD_FAST         'item'
+305	CALL_FUNCTION_1   None
+308	LOAD_CONST        1
+311	COMPARE_OP        '!='
+314	POP_JUMP_IF_TRUE  '337'
+317	LOAD_FAST         'item'
+320	LOAD_CONST        0
+323	BINARY_SUBSCR     None
+324	LOAD_CONST        0
+327	BINARY_SUBSCR     None
+328	LOAD_GLOBAL       'LITERAL'
+331	COMPARE_OP        '!='
+334_0	COME_FROM         '314'
+334	POP_JUMP_IF_FALSE '293'
+
+337	BREAK_LOOP        None
+338	JUMP_BACK         '293'
+341	JUMP_BACK         '293'
+344	POP_BLOCK         None
+
+345	BUILD_LIST_0      None
+348	STORE_FAST        'set'
+
+351	LOAD_FAST         'set'
+354	LOAD_ATTR         'append'
+357	STORE_FAST        'setappend'
+
+360	SETUP_LOOP        '391'
+363	LOAD_FAST         'items'
+366	GET_ITER          None
+367	FOR_ITER          '390'
+370	STORE_FAST        'item'
+
+373	LOAD_FAST         'setappend'
+376	LOAD_FAST         'item'
+379	LOAD_CONST        0
+382	BINARY_SUBSCR     None
+383	CALL_FUNCTION_1   None
+386	POP_TOP           None
+387	JUMP_BACK         '367'
+390	POP_BLOCK         None
+391_0	COME_FROM         '360'
+
+391	LOAD_FAST         'subpatternappend'
+394	LOAD_GLOBAL       'IN'
+397	LOAD_FAST         'set'
+400	BUILD_TUPLE_2     None
+403	CALL_FUNCTION_1   None
+406	POP_TOP           None
+
+407	LOAD_FAST         'subpattern'
+410	RETURN_VALUE      None
+411_0	COME_FROM         '286'
+
+411	LOAD_FAST         'subpattern'
+414	LOAD_ATTR         'append'
+417	LOAD_GLOBAL       'BRANCH'
+420	LOAD_CONST        None
+423	LOAD_FAST         'items'
+426	BUILD_TUPLE_2     None
+429	BUILD_TUPLE_2     None
+432	CALL_FUNCTION_1   None
+435	POP_TOP           None
+
+436	LOAD_FAST         'subpattern'
+439	RETURN_VALUE      None
+
+Syntax error at or near `POP_BLOCK' token at offset 115
+
+
+def _parse_sub_cond(source, state, condgroup):
+    item_yes = _parse(source, state)
+    if source.match('|'):
+        item_no = _parse(source, state)
+        if source.match('|'):
+            raise error, 'conditional backref with more than two branches'
+    else:
+        item_no = None
+    if source.next and not source.match(')', 0):
+        raise error, 'pattern not properly closed'
+    subpattern = SubPattern(state)
+    subpattern.append((GROUPREF_EXISTS, (condgroup, item_yes, item_no)))
+    return subpattern
+
+
+_PATTERNENDERS = set('|)')
+_ASSERTCHARS = set('=!<')
+_LOOKBEHINDASSERTCHARS = set('=!')
+_REPEATCODES = set([MIN_REPEAT, MAX_REPEAT])
+
+def _parse--- This code section failed: ---
+
+0	LOAD_GLOBAL       'SubPattern'
+3	LOAD_FAST         'state'
+6	CALL_FUNCTION_1   None
+9	STORE_FAST        'subpattern'
+
+12	LOAD_FAST         'subpattern'
+15	LOAD_ATTR         'append'
+18	STORE_FAST        'subpatternappend'
+
+21	LOAD_FAST         'source'
+24	LOAD_ATTR         'get'
+27	STORE_FAST        'sourceget'
+
+30	LOAD_FAST         'source'
+33	LOAD_ATTR         'match'
+36	STORE_FAST        'sourcematch'
+
+39	LOAD_GLOBAL       'len'
+42	STORE_FAST        '_len'
+
+45	LOAD_GLOBAL       '_PATTERNENDERS'
+48	STORE_FAST        'PATTERNENDERS'
+
+51	LOAD_GLOBAL       '_ASSERTCHARS'
+54	STORE_FAST        'ASSERTCHARS'
+
+57	LOAD_GLOBAL       '_LOOKBEHINDASSERTCHARS'
+60	STORE_FAST        'LOOKBEHINDASSERTCHARS'
+
+63	LOAD_GLOBAL       '_REPEATCODES'
+66	STORE_FAST        'REPEATCODES'
+
+69	SETUP_LOOP        '3052'
+
+72	LOAD_FAST         'source'
+75	LOAD_ATTR         'next'
+78	LOAD_FAST         'PATTERNENDERS'
+81	COMPARE_OP        'in'
+84	POP_JUMP_IF_FALSE '91'
+
+87	BREAK_LOOP        None
+88	JUMP_FORWARD      '91'
+91_0	COME_FROM         '88'
+
+91	LOAD_FAST         'sourceget'
+94	CALL_FUNCTION_0   None
+97	STORE_FAST        'this'
+
+100	LOAD_FAST         'this'
+103	LOAD_CONST        None
+106	COMPARE_OP        'is'
+109	POP_JUMP_IF_FALSE '116'
+
+112	BREAK_LOOP        None
+113	JUMP_FORWARD      '116'
+116_0	COME_FROM         '113'
+
+116	LOAD_FAST         'state'
+119	LOAD_ATTR         'flags'
+122	LOAD_GLOBAL       'SRE_FLAG_VERBOSE'
+125	BINARY_AND        None
+126	POP_JUMP_IF_FALSE '200'
+
+129	LOAD_FAST         'this'
+132	LOAD_GLOBAL       'WHITESPACE'
+135	COMPARE_OP        'in'
+138	POP_JUMP_IF_FALSE '147'
+
+141	CONTINUE          '72'
+144	JUMP_FORWARD      '147'
+147_0	COME_FROM         '144'
+
+147	LOAD_FAST         'this'
+150	LOAD_CONST        '#'
+153	COMPARE_OP        '=='
+156	POP_JUMP_IF_FALSE '200'
+
+159	SETUP_LOOP        '191'
+
+162	LOAD_FAST         'sourceget'
+165	CALL_FUNCTION_0   None
+168	STORE_FAST        'this'
+
+171	LOAD_FAST         'this'
+174	LOAD_CONST        (None, '\n')
+177	COMPARE_OP        'in'
+180	POP_JUMP_IF_FALSE '162'
+
+183	BREAK_LOOP        None
+184	JUMP_BACK         '162'
+187	JUMP_BACK         '162'
+190	POP_BLOCK         None
+191_0	COME_FROM         '159'
+
+191	CONTINUE          '72'
+194	JUMP_ABSOLUTE     '200'
+197	JUMP_FORWARD      '200'
+200_0	COME_FROM         '197'
+
+200	LOAD_FAST         'this'
+203	POP_JUMP_IF_FALSE '247'
+206	LOAD_FAST         'this'
+209	LOAD_CONST        0
+212	BINARY_SUBSCR     None
+213	LOAD_GLOBAL       'SPECIAL_CHARS'
+216	COMPARE_OP        'not in'
+219_0	COME_FROM         '203'
+219	POP_JUMP_IF_FALSE '247'
+
+222	LOAD_FAST         'subpatternappend'
+225	LOAD_GLOBAL       'LITERAL'
+228	LOAD_GLOBAL       'ord'
+231	LOAD_FAST         'this'
+234	CALL_FUNCTION_1   None
+237	BUILD_TUPLE_2     None
+240	CALL_FUNCTION_1   None
+243	POP_TOP           None
+244	JUMP_BACK         '72'
+
+247	LOAD_FAST         'this'
+250	LOAD_CONST        '['
+253	COMPARE_OP        '=='
+256	POP_JUMP_IF_FALSE '919'
+
+259	BUILD_LIST_0      None
+262	STORE_FAST        'set'
+
+265	LOAD_FAST         'set'
+268	LOAD_ATTR         'append'
+271	STORE_FAST        'setappend'
+
+274	LOAD_FAST         'sourcematch'
+277	LOAD_CONST        '^'
+280	CALL_FUNCTION_1   None
+283	POP_JUMP_IF_FALSE '305'
+
+286	LOAD_FAST         'setappend'
+289	LOAD_GLOBAL       'NEGATE'
+292	LOAD_CONST        None
+295	BUILD_TUPLE_2     None
+298	CALL_FUNCTION_1   None
+301	POP_TOP           None
+302	JUMP_FORWARD      '305'
+305_0	COME_FROM         '302'
+
+305	LOAD_FAST         'set'
+308	SLICE+0           None
+309	STORE_FAST        'start'
+
+312	SETUP_LOOP        '760'
+
+315	LOAD_FAST         'sourceget'
+318	CALL_FUNCTION_0   None
+321	STORE_FAST        'this'
+
+324	LOAD_FAST         'this'
+327	LOAD_CONST        ']'
+330	COMPARE_OP        '=='
+333	POP_JUMP_IF_FALSE '352'
+336	LOAD_FAST         'set'
+339	LOAD_FAST         'start'
+342	COMPARE_OP        '!='
+345_0	COME_FROM         '333'
+345	POP_JUMP_IF_FALSE '352'
+
+348	BREAK_LOOP        None
+349	JUMP_FORWARD      '428'
+
+352	LOAD_FAST         'this'
+355	POP_JUMP_IF_FALSE '392'
+358	LOAD_FAST         'this'
+361	LOAD_CONST        0
+364	BINARY_SUBSCR     None
+365	LOAD_CONST        '\\'
+368	COMPARE_OP        '=='
+371_0	COME_FROM         '355'
+371	POP_JUMP_IF_FALSE '392'
+
+374	LOAD_GLOBAL       '_class_escape'
+377	LOAD_FAST         'source'
+380	LOAD_FAST         'this'
+383	CALL_FUNCTION_2   None
+386	STORE_FAST        'code1'
+389	JUMP_FORWARD      '428'
+
+392	LOAD_FAST         'this'
+395	POP_JUMP_IF_FALSE '419'
+
+398	LOAD_GLOBAL       'LITERAL'
+401	LOAD_GLOBAL       'ord'
+404	LOAD_FAST         'this'
+407	CALL_FUNCTION_1   None
+410	BUILD_TUPLE_2     None
+413	STORE_FAST        'code1'
+416	JUMP_FORWARD      '428'
+
+419	LOAD_GLOBAL       'error'
+422	LOAD_CONST        'unexpected end of regular expression'
+425	RAISE_VARARGS_2   None
+428_0	COME_FROM         '349'
+428_1	COME_FROM         '389'
+428_2	COME_FROM         '416'
+
+428	LOAD_FAST         'sourcematch'
+431	LOAD_CONST        '-'
+434	CALL_FUNCTION_1   None
+437	POP_JUMP_IF_FALSE '713'
+
+440	LOAD_FAST         'sourceget'
+443	CALL_FUNCTION_0   None
+446	STORE_FAST        'this'
+
+449	LOAD_FAST         'this'
+452	LOAD_CONST        ']'
+455	COMPARE_OP        '=='
+458	POP_JUMP_IF_FALSE '530'
+
+461	LOAD_FAST         'code1'
+464	LOAD_CONST        0
+467	BINARY_SUBSCR     None
+468	LOAD_GLOBAL       'IN'
+471	COMPARE_OP        'is'
+474	POP_JUMP_IF_FALSE '494'
+
+477	LOAD_FAST         'code1'
+480	LOAD_CONST        1
+483	BINARY_SUBSCR     None
+484	LOAD_CONST        0
+487	BINARY_SUBSCR     None
+488	STORE_FAST        'code1'
+491	JUMP_FORWARD      '494'
+494_0	COME_FROM         '491'
+
+494	LOAD_FAST         'setappend'
+497	LOAD_FAST         'code1'
+500	CALL_FUNCTION_1   None
+503	POP_TOP           None
+
+504	LOAD_FAST         'setappend'
+507	LOAD_GLOBAL       'LITERAL'
+510	LOAD_GLOBAL       'ord'
+513	LOAD_CONST        '-'
+516	CALL_FUNCTION_1   None
+519	BUILD_TUPLE_2     None
+522	CALL_FUNCTION_1   None
+525	POP_TOP           None
+
+526	BREAK_LOOP        None
+527	JUMP_ABSOLUTE     '756'
+
+530	LOAD_FAST         'this'
+533	POP_JUMP_IF_FALSE '701'
+
+536	LOAD_FAST         'this'
+539	LOAD_CONST        0
+542	BINARY_SUBSCR     None
+543	LOAD_CONST        '\\'
+546	COMPARE_OP        '=='
+549	POP_JUMP_IF_FALSE '570'
+
+552	LOAD_GLOBAL       '_class_escape'
+555	LOAD_FAST         'source'
+558	LOAD_FAST         'this'
+561	CALL_FUNCTION_2   None
+564	STORE_FAST        'code2'
+567	JUMP_FORWARD      '588'
+
+570	LOAD_GLOBAL       'LITERAL'
+573	LOAD_GLOBAL       'ord'
+576	LOAD_FAST         'this'
+579	CALL_FUNCTION_1   None
+582	BUILD_TUPLE_2     None
+585	STORE_FAST        'code2'
+588_0	COME_FROM         '567'
+
+588	LOAD_FAST         'code1'
+591	LOAD_CONST        0
+594	BINARY_SUBSCR     None
+595	LOAD_GLOBAL       'LITERAL'
+598	COMPARE_OP        '!='
+601	POP_JUMP_IF_TRUE  '620'
+604	LOAD_FAST         'code2'
+607	LOAD_CONST        0
+610	BINARY_SUBSCR     None
+611	LOAD_GLOBAL       'LITERAL'
+614	COMPARE_OP        '!='
+617_0	COME_FROM         '601'
+617	POP_JUMP_IF_FALSE '632'
+
+620	LOAD_GLOBAL       'error'
+623	LOAD_CONST        'bad character range'
+626	RAISE_VARARGS_2   None
+629	JUMP_FORWARD      '632'
+632_0	COME_FROM         '629'
+
+632	LOAD_FAST         'code1'
+635	LOAD_CONST        1
+638	BINARY_SUBSCR     None
+639	STORE_FAST        'lo'
+
+642	LOAD_FAST         'code2'
+645	LOAD_CONST        1
+648	BINARY_SUBSCR     None
+649	STORE_FAST        'hi'
+
+652	LOAD_FAST         'hi'
+655	LOAD_FAST         'lo'
+658	COMPARE_OP        '<'
+661	POP_JUMP_IF_FALSE '676'
+
+664	LOAD_GLOBAL       'error'
+667	LOAD_CONST        'bad character range'
+670	RAISE_VARARGS_2   None
+673	JUMP_FORWARD      '676'
+676_0	COME_FROM         '673'
+
+676	LOAD_FAST         'setappend'
+679	LOAD_GLOBAL       'RANGE'
+682	LOAD_FAST         'lo'
+685	LOAD_FAST         'hi'
+688	BUILD_TUPLE_2     None
+691	BUILD_TUPLE_2     None
+694	CALL_FUNCTION_1   None
+697	POP_TOP           None
+698	JUMP_ABSOLUTE     '756'
+
+701	LOAD_GLOBAL       'error'
+704	LOAD_CONST        'unexpected end of regular expression'
+707	RAISE_VARARGS_2   None
+710	JUMP_BACK         '315'
+
+713	LOAD_FAST         'code1'
+716	LOAD_CONST        0
+719	BINARY_SUBSCR     None
+720	LOAD_GLOBAL       'IN'
+723	COMPARE_OP        'is'
+726	POP_JUMP_IF_FALSE '746'
+
+729	LOAD_FAST         'code1'
+732	LOAD_CONST        1
+735	BINARY_SUBSCR     None
+736	LOAD_CONST        0
+739	BINARY_SUBSCR     None
+740	STORE_FAST        'code1'
+743	JUMP_FORWARD      '746'
+746_0	COME_FROM         '743'
+
+746	LOAD_FAST         'setappend'
+749	LOAD_FAST         'code1'
+752	CALL_FUNCTION_1   None
+755	POP_TOP           None
+756	JUMP_BACK         '315'
+759	POP_BLOCK         None
+760_0	COME_FROM         '312'
+
+760	LOAD_FAST         '_len'
+763	LOAD_FAST         'set'
+766	CALL_FUNCTION_1   None
+769	LOAD_CONST        1
+772	COMPARE_OP        '=='
+775	POP_JUMP_IF_FALSE '815'
+778	LOAD_FAST         'set'
+781	LOAD_CONST        0
+784	BINARY_SUBSCR     None
+785	LOAD_CONST        0
+788	BINARY_SUBSCR     None
+789	LOAD_GLOBAL       'LITERAL'
+792	COMPARE_OP        'is'
+795_0	COME_FROM         '775'
+795	POP_JUMP_IF_FALSE '815'
+
+798	LOAD_FAST         'subpatternappend'
+801	LOAD_FAST         'set'
+804	LOAD_CONST        0
+807	BINARY_SUBSCR     None
+808	CALL_FUNCTION_1   None
+811	POP_TOP           None
+812	JUMP_ABSOLUTE     '3048'
+
+815	LOAD_FAST         '_len'
+818	LOAD_FAST         'set'
+821	CALL_FUNCTION_1   None
+824	LOAD_CONST        2
+827	COMPARE_OP        '=='
+830	POP_JUMP_IF_FALSE '900'
+833	LOAD_FAST         'set'
+836	LOAD_CONST        0
+839	BINARY_SUBSCR     None
+840	LOAD_CONST        0
+843	BINARY_SUBSCR     None
+844	LOAD_GLOBAL       'NEGATE'
+847	COMPARE_OP        'is'
+850	POP_JUMP_IF_FALSE '900'
+853	LOAD_FAST         'set'
+856	LOAD_CONST        1
+859	BINARY_SUBSCR     None
+860	LOAD_CONST        0
+863	BINARY_SUBSCR     None
+864	LOAD_GLOBAL       'LITERAL'
+867	COMPARE_OP        'is'
+870_0	COME_FROM         '830'
+870_1	COME_FROM         '850'
+870	POP_JUMP_IF_FALSE '900'
+
+873	LOAD_FAST         'subpatternappend'
+876	LOAD_GLOBAL       'NOT_LITERAL'
+879	LOAD_FAST         'set'
+882	LOAD_CONST        1
+885	BINARY_SUBSCR     None
+886	LOAD_CONST        1
+889	BINARY_SUBSCR     None
+890	BUILD_TUPLE_2     None
+893	CALL_FUNCTION_1   None
+896	POP_TOP           None
+897	JUMP_ABSOLUTE     '3048'
+
+900	LOAD_FAST         'subpatternappend'
+903	LOAD_GLOBAL       'IN'
+906	LOAD_FAST         'set'
+909	BUILD_TUPLE_2     None
+912	CALL_FUNCTION_1   None
+915	POP_TOP           None
+916	JUMP_BACK         '72'
+
+919	LOAD_FAST         'this'
+922	POP_JUMP_IF_FALSE '1578'
+925	LOAD_FAST         'this'
+928	LOAD_CONST        0
+931	BINARY_SUBSCR     None
+932	LOAD_GLOBAL       'REPEAT_CHARS'
+935	COMPARE_OP        'in'
+938_0	COME_FROM         '922'
+938	POP_JUMP_IF_FALSE '1578'
+
+941	LOAD_FAST         'this'
+944	LOAD_CONST        '?'
+947	COMPARE_OP        '=='
+950	POP_JUMP_IF_FALSE '968'
+
+953	LOAD_CONST        (0, 1)
+956	UNPACK_SEQUENCE_2 None
+959	STORE_FAST        'min'
+962	STORE_FAST        'max'
+965	JUMP_FORWARD      '1396'
+
+968	LOAD_FAST         'this'
+971	LOAD_CONST        '*'
+974	COMPARE_OP        '=='
+977	POP_JUMP_IF_FALSE '996'
+
+980	LOAD_CONST        0
+983	LOAD_GLOBAL       'MAXREPEAT'
+986	ROT_TWO           None
+987	STORE_FAST        'min'
+990	STORE_FAST        'max'
+993	JUMP_FORWARD      '1396'
+
+996	LOAD_FAST         'this'
+999	LOAD_CONST        '+'
+1002	COMPARE_OP        '=='
+1005	POP_JUMP_IF_FALSE '1024'
+
+1008	LOAD_CONST        1
+1011	LOAD_GLOBAL       'MAXREPEAT'
+1014	ROT_TWO           None
+1015	STORE_FAST        'min'
+1018	STORE_FAST        'max'
+1021	JUMP_FORWARD      '1396'
+
+1024	LOAD_FAST         'this'
+1027	LOAD_CONST        '{'
+1030	COMPARE_OP        '=='
+1033	POP_JUMP_IF_FALSE '1387'
+
+1036	LOAD_FAST         'source'
+1039	LOAD_ATTR         'next'
+1042	LOAD_CONST        '}'
+1045	COMPARE_OP        '=='
+1048	POP_JUMP_IF_FALSE '1079'
+
+1051	LOAD_FAST         'subpatternappend'
+1054	LOAD_GLOBAL       'LITERAL'
+1057	LOAD_GLOBAL       'ord'
+1060	LOAD_FAST         'this'
+1063	CALL_FUNCTION_1   None
+1066	BUILD_TUPLE_2     None
+1069	CALL_FUNCTION_1   None
+1072	POP_TOP           None
+
+1073	CONTINUE          '72'
+1076	JUMP_FORWARD      '1079'
+1079_0	COME_FROM         '1076'
+
+1079	LOAD_FAST         'source'
+1082	LOAD_ATTR         'tell'
+1085	CALL_FUNCTION_0   None
+1088	STORE_FAST        'here'
+
+1091	LOAD_CONST        0
+1094	LOAD_GLOBAL       'MAXREPEAT'
+1097	ROT_TWO           None
+1098	STORE_FAST        'min'
+1101	STORE_FAST        'max'
+
+1104	LOAD_CONST        ''
+1107	DUP_TOP           None
+1108	STORE_FAST        'lo'
+1111	STORE_FAST        'hi'
+
+1114	SETUP_LOOP        '1152'
+1117	LOAD_FAST         'source'
+1120	LOAD_ATTR         'next'
+1123	LOAD_GLOBAL       'DIGITS'
+1126	COMPARE_OP        'in'
+1129	POP_JUMP_IF_FALSE '1151'
+
+1132	LOAD_FAST         'lo'
+1135	LOAD_FAST         'source'
+1138	LOAD_ATTR         'get'
+1141	CALL_FUNCTION_0   None
+1144	BINARY_ADD        None
+1145	STORE_FAST        'lo'
+1148	JUMP_BACK         '1117'
+1151	POP_BLOCK         None
+1152_0	COME_FROM         '1114'
+
+1152	LOAD_FAST         'sourcematch'
+1155	LOAD_CONST        ','
+1158	CALL_FUNCTION_1   None
+1161	POP_JUMP_IF_FALSE '1202'
+
+1164	SETUP_LOOP        '1208'
+1167	LOAD_FAST         'source'
+1170	LOAD_ATTR         'next'
+1173	LOAD_GLOBAL       'DIGITS'
+1176	COMPARE_OP        'in'
+1179	POP_JUMP_IF_FALSE '1198'
+
+1182	LOAD_FAST         'hi'
+1185	LOAD_FAST         'sourceget'
+1188	CALL_FUNCTION_0   None
+1191	BINARY_ADD        None
+1192	STORE_FAST        'hi'
+1195	JUMP_BACK         '1167'
+1198	POP_BLOCK         None
+1199_0	COME_FROM         '1164'
+1199	JUMP_FORWARD      '1208'
+
+1202	LOAD_FAST         'lo'
+1205	STORE_FAST        'hi'
+1208_0	COME_FROM         '1199'
+
+1208	LOAD_FAST         'sourcematch'
+1211	LOAD_CONST        '}'
+1214	CALL_FUNCTION_1   None
+1217	POP_JUMP_IF_TRUE  '1261'
+
+1220	LOAD_FAST         'subpatternappend'
+1223	LOAD_GLOBAL       'LITERAL'
+1226	LOAD_GLOBAL       'ord'
+1229	LOAD_FAST         'this'
+1232	CALL_FUNCTION_1   None
+1235	BUILD_TUPLE_2     None
+1238	CALL_FUNCTION_1   None
+1241	POP_TOP           None
+
+1242	LOAD_FAST         'source'
+1245	LOAD_ATTR         'seek'
+1248	LOAD_FAST         'here'
+1251	CALL_FUNCTION_1   None
+1254	POP_TOP           None
+
+1255	CONTINUE          '72'
+1258	JUMP_FORWARD      '1261'
+1261_0	COME_FROM         '1258'
+
+1261	LOAD_FAST         'lo'
+1264	POP_JUMP_IF_FALSE '1309'
+
+1267	LOAD_GLOBAL       'int'
+1270	LOAD_FAST         'lo'
+1273	CALL_FUNCTION_1   None
+1276	STORE_FAST        'min'
+
+1279	LOAD_FAST         'min'
+1282	LOAD_GLOBAL       'MAXREPEAT'
+1285	COMPARE_OP        '>='
+1288	POP_JUMP_IF_FALSE '1309'
+
+1291	LOAD_GLOBAL       'OverflowError'
+1294	LOAD_CONST        'the repetition number is too large'
+1297	CALL_FUNCTION_1   None
+1300	RAISE_VARARGS_1   None
+1303	JUMP_ABSOLUTE     '1309'
+1306	JUMP_FORWARD      '1309'
+1309_0	COME_FROM         '1306'
+
+1309	LOAD_FAST         'hi'
+1312	POP_JUMP_IF_FALSE '1396'
+
+1315	LOAD_GLOBAL       'int'
+1318	LOAD_FAST         'hi'
+1321	CALL_FUNCTION_1   None
+1324	STORE_FAST        'max'
+
+1327	LOAD_FAST         'max'
+1330	LOAD_GLOBAL       'MAXREPEAT'
+1333	COMPARE_OP        '>='
+1336	POP_JUMP_IF_FALSE '1354'
+
+1339	LOAD_GLOBAL       'OverflowError'
+1342	LOAD_CONST        'the repetition number is too large'
+1345	CALL_FUNCTION_1   None
+1348	RAISE_VARARGS_1   None
+1351	JUMP_FORWARD      '1354'
+1354_0	COME_FROM         '1351'
+
+1354	LOAD_FAST         'max'
+1357	LOAD_FAST         'min'
+1360	COMPARE_OP        '<'
+1363	POP_JUMP_IF_FALSE '1384'
+
+1366	LOAD_GLOBAL       'error'
+1369	LOAD_CONST        'bad repeat interval'
+1372	CALL_FUNCTION_1   None
+1375	RAISE_VARARGS_1   None
+1378	JUMP_ABSOLUTE     '1384'
+1381	JUMP_ABSOLUTE     '1396'
+1384	JUMP_FORWARD      '1396'
+
+1387	LOAD_GLOBAL       'error'
+1390	LOAD_CONST        'not supported'
+1393	RAISE_VARARGS_2   None
+1396_0	COME_FROM         '965'
+1396_1	COME_FROM         '993'
+1396_2	COME_FROM         '1021'
+1396_3	COME_FROM         '1384'
+
+1396	LOAD_FAST         'subpattern'
+1399	POP_JUMP_IF_FALSE '1415'
+
+1402	LOAD_FAST         'subpattern'
+1405	LOAD_CONST        -1
+1408	SLICE+1           None
+1409	STORE_FAST        'item'
+1412	JUMP_FORWARD      '1421'
+
+1415	LOAD_CONST        None
+1418	STORE_FAST        'item'
+1421_0	COME_FROM         '1412'
+
+1421	LOAD_FAST         'item'
+1424	UNARY_NOT         None
+1425	POP_JUMP_IF_TRUE  '1466'
+1428	LOAD_FAST         '_len'
+1431	LOAD_FAST         'item'
+1434	CALL_FUNCTION_1   None
+1437	LOAD_CONST        1
+1440	COMPARE_OP        '=='
+1443	POP_JUMP_IF_FALSE '1478'
+1446	LOAD_FAST         'item'
+1449	LOAD_CONST        0
+1452	BINARY_SUBSCR     None
+1453	LOAD_CONST        0
+1456	BINARY_SUBSCR     None
+1457	LOAD_GLOBAL       'AT'
+1460	COMPARE_OP        '=='
+1463_0	COME_FROM         '1425'
+1463_1	COME_FROM         '1443'
+1463	POP_JUMP_IF_FALSE '1478'
+
+1466	LOAD_GLOBAL       'error'
+1469	LOAD_CONST        'nothing to repeat'
+1472	RAISE_VARARGS_2   None
+1475	JUMP_FORWARD      '1478'
+1478_0	COME_FROM         '1475'
+
+1478	LOAD_FAST         'item'
+1481	LOAD_CONST        0
+1484	BINARY_SUBSCR     None
+1485	LOAD_CONST        0
+1488	BINARY_SUBSCR     None
+1489	LOAD_FAST         'REPEATCODES'
+1492	COMPARE_OP        'in'
+1495	POP_JUMP_IF_FALSE '1510'
+
+1498	LOAD_GLOBAL       'error'
+1501	LOAD_CONST        'multiple repeat'
+1504	RAISE_VARARGS_2   None
+1507	JUMP_FORWARD      '1510'
+1510_0	COME_FROM         '1507'
+
+1510	LOAD_FAST         'sourcematch'
+1513	LOAD_CONST        '?'
+1516	CALL_FUNCTION_1   None
+1519	POP_JUMP_IF_FALSE '1550'
+
+1522	LOAD_GLOBAL       'MIN_REPEAT'
+1525	LOAD_FAST         'min'
+1528	LOAD_FAST         'max'
+1531	LOAD_FAST         'item'
+1534	BUILD_TUPLE_3     None
+1537	BUILD_TUPLE_2     None
+1540	LOAD_FAST         'subpattern'
+1543	LOAD_CONST        -1
+1546	STORE_SUBSCR      None
+1547	JUMP_ABSOLUTE     '3048'
+
+1550	LOAD_GLOBAL       'MAX_REPEAT'
+1553	LOAD_FAST         'min'
+1556	LOAD_FAST         'max'
+1559	LOAD_FAST         'item'
+1562	BUILD_TUPLE_3     None
+1565	BUILD_TUPLE_2     None
+1568	LOAD_FAST         'subpattern'
+1571	LOAD_CONST        -1
+1574	STORE_SUBSCR      None
+1575	JUMP_BACK         '72'
+
+1578	LOAD_FAST         'this'
+1581	LOAD_CONST        '.'
+1584	COMPARE_OP        '=='
+1587	POP_JUMP_IF_FALSE '1609'
+
+1590	LOAD_FAST         'subpatternappend'
+1593	LOAD_GLOBAL       'ANY'
+1596	LOAD_CONST        None
+1599	BUILD_TUPLE_2     None
+1602	CALL_FUNCTION_1   None
+1605	POP_TOP           None
+1606	JUMP_BACK         '72'
+
+1609	LOAD_FAST         'this'
+1612	LOAD_CONST        '('
+1615	COMPARE_OP        '=='
+1618	POP_JUMP_IF_FALSE '2921'
+
+1621	LOAD_CONST        1
+1624	STORE_FAST        'group'
+
+1627	LOAD_CONST        None
+1630	STORE_FAST        'name'
+
+1633	LOAD_CONST        None
+1636	STORE_FAST        'condgroup'
+
+1639	LOAD_FAST         'sourcematch'
+1642	LOAD_CONST        '?'
+1645	CALL_FUNCTION_1   None
+1648	POP_JUMP_IF_FALSE '2692'
+
+1651	LOAD_CONST        0
+1654	STORE_FAST        'group'
+
+1657	LOAD_FAST         'sourcematch'
+1660	LOAD_CONST        'P'
+1663	CALL_FUNCTION_1   None
+1666	POP_JUMP_IF_FALSE '2081'
+
+1669	LOAD_FAST         'sourcematch'
+1672	LOAD_CONST        '<'
+1675	CALL_FUNCTION_1   None
+1678	POP_JUMP_IF_FALSE '1814'
+
+1681	LOAD_CONST        ''
+1684	STORE_FAST        'name'
+
+1687	SETUP_LOOP        '1753'
+
+1690	LOAD_FAST         'sourceget'
+1693	CALL_FUNCTION_0   None
+1696	STORE_FAST        'char'
+
+1699	LOAD_FAST         'char'
+1702	LOAD_CONST        None
+1705	COMPARE_OP        'is'
+1708	POP_JUMP_IF_FALSE '1723'
+
+1711	LOAD_GLOBAL       'error'
+1714	LOAD_CONST        'unterminated name'
+1717	RAISE_VARARGS_2   None
+1720	JUMP_FORWARD      '1723'
+1723_0	COME_FROM         '1720'
+
+1723	LOAD_FAST         'char'
+1726	LOAD_CONST        '>'
+1729	COMPARE_OP        '=='
+1732	POP_JUMP_IF_FALSE '1739'
+
+1735	BREAK_LOOP        None
+1736	JUMP_FORWARD      '1739'
+1739_0	COME_FROM         '1736'
+
+1739	LOAD_FAST         'name'
+1742	LOAD_FAST         'char'
+1745	BINARY_ADD        None
+1746	STORE_FAST        'name'
+1749	JUMP_BACK         '1690'
+1752	POP_BLOCK         None
+1753_0	COME_FROM         '1687'
+
+1753	LOAD_CONST        1
+1756	STORE_FAST        'group'
+
+1759	LOAD_FAST         'name'
+1762	POP_JUMP_IF_TRUE  '1780'
+
+1765	LOAD_GLOBAL       'error'
+1768	LOAD_CONST        'missing group name'
+1771	CALL_FUNCTION_1   None
+1774	RAISE_VARARGS_1   None
+1777	JUMP_FORWARD      '1780'
+1780_0	COME_FROM         '1777'
+
+1780	LOAD_GLOBAL       'isname'
+1783	LOAD_FAST         'name'
+1786	CALL_FUNCTION_1   None
+1789	POP_JUMP_IF_TRUE  '2078'
+
+1792	LOAD_GLOBAL       'error'
+1795	LOAD_CONST        'bad character in group name %r'
+
+1798	LOAD_FAST         'name'
+1801	BINARY_MODULO     None
+1802	CALL_FUNCTION_1   None
+1805	RAISE_VARARGS_1   None
+1808	JUMP_ABSOLUTE     '2078'
+1811	JUMP_ABSOLUTE     '2689'
+
+1814	LOAD_FAST         'sourcematch'
+1817	LOAD_CONST        '='
+1820	CALL_FUNCTION_1   None
+1823	POP_JUMP_IF_FALSE '2032'
+
+1826	LOAD_CONST        ''
+1829	STORE_FAST        'name'
+
+1832	SETUP_LOOP        '1898'
+
+1835	LOAD_FAST         'sourceget'
+1838	CALL_FUNCTION_0   None
+1841	STORE_FAST        'char'
+
+1844	LOAD_FAST         'char'
+1847	LOAD_CONST        None
+1850	COMPARE_OP        'is'
+1853	POP_JUMP_IF_FALSE '1868'
+
+1856	LOAD_GLOBAL       'error'
+1859	LOAD_CONST        'unterminated name'
+1862	RAISE_VARARGS_2   None
+1865	JUMP_FORWARD      '1868'
+1868_0	COME_FROM         '1865'
+
+1868	LOAD_FAST         'char'
+1871	LOAD_CONST        ')'
+1874	COMPARE_OP        '=='
+1877	POP_JUMP_IF_FALSE '1884'
+
+1880	BREAK_LOOP        None
+1881	JUMP_FORWARD      '1884'
+1884_0	COME_FROM         '1881'
+
+1884	LOAD_FAST         'name'
+1887	LOAD_FAST         'char'
+1890	BINARY_ADD        None
+1891	STORE_FAST        'name'
+1894	JUMP_BACK         '1835'
+1897	POP_BLOCK         None
+1898_0	COME_FROM         '1832'
+
+1898	LOAD_FAST         'name'
+1901	POP_JUMP_IF_TRUE  '1919'
+
+1904	LOAD_GLOBAL       'error'
+1907	LOAD_CONST        'missing group name'
+1910	CALL_FUNCTION_1   None
+1913	RAISE_VARARGS_1   None
+1916	JUMP_FORWARD      '1919'
+1919_0	COME_FROM         '1916'
+
+1919	LOAD_GLOBAL       'isname'
+1922	LOAD_FAST         'name'
+1925	CALL_FUNCTION_1   None
+1928	POP_JUMP_IF_TRUE  '1950'
+
+1931	LOAD_GLOBAL       'error'
+1934	LOAD_CONST        'bad character in backref group name %r'
+
+1937	LOAD_FAST         'name'
+1940	BINARY_MODULO     None
+1941	CALL_FUNCTION_1   None
+1944	RAISE_VARARGS_1   None
+1947	JUMP_FORWARD      '1950'
+1950_0	COME_FROM         '1947'
+
+1950	LOAD_FAST         'state'
+1953	LOAD_ATTR         'groupdict'
+1956	LOAD_ATTR         'get'
+1959	LOAD_FAST         'name'
+1962	CALL_FUNCTION_1   None
+1965	STORE_FAST        'gid'
+
+1968	LOAD_FAST         'gid'
+1971	LOAD_CONST        None
+1974	COMPARE_OP        'is'
+1977	POP_JUMP_IF_FALSE '2010'
+
+1980	LOAD_CONST        'unknown group name: {0!r}'
+1983	LOAD_ATTR         'format'
+1986	LOAD_FAST         'name'
+1989	CALL_FUNCTION_1   None
+1992	STORE_FAST        'msg'
+
+1995	LOAD_GLOBAL       'error'
+1998	LOAD_FAST         'msg'
+2001	CALL_FUNCTION_1   None
+2004	RAISE_VARARGS_1   None
+2007	JUMP_FORWARD      '2010'
+2010_0	COME_FROM         '2007'
+
+2010	LOAD_FAST         'subpatternappend'
+2013	LOAD_GLOBAL       'GROUPREF'
+2016	LOAD_FAST         'gid'
+2019	BUILD_TUPLE_2     None
+2022	CALL_FUNCTION_1   None
+2025	POP_TOP           None
+
+2026	CONTINUE          '72'
+2029	JUMP_ABSOLUTE     '2689'
+
+2032	LOAD_FAST         'sourceget'
+2035	CALL_FUNCTION_0   None
+2038	STORE_FAST        'char'
+
+2041	LOAD_FAST         'char'
+2044	LOAD_CONST        None
+2047	COMPARE_OP        'is'
+2050	POP_JUMP_IF_FALSE '2065'
+
+2053	LOAD_GLOBAL       'error'
+2056	LOAD_CONST        'unexpected end of pattern'
+2059	RAISE_VARARGS_2   None
+2062	JUMP_FORWARD      '2065'
+2065_0	COME_FROM         '2062'
+
+2065	LOAD_GLOBAL       'error'
+2068	LOAD_CONST        'unknown specifier: ?P%s'
+2071	LOAD_FAST         'char'
+2074	BINARY_MODULO     None
+2075	RAISE_VARARGS_2   None
+2078	JUMP_ABSOLUTE     '2692'
+
+2081	LOAD_FAST         'sourcematch'
+2084	LOAD_CONST        ':'
+2087	CALL_FUNCTION_1   None
+2090	POP_JUMP_IF_FALSE '2102'
+
+2093	LOAD_CONST        2
+2096	STORE_FAST        'group'
+2099	JUMP_ABSOLUTE     '2692'
+
+2102	LOAD_FAST         'sourcematch'
+2105	LOAD_CONST        '#'
+2108	CALL_FUNCTION_1   None
+2111	POP_JUMP_IF_FALSE '2192'
+
+2114	SETUP_LOOP        '2162'
+
+2117	LOAD_FAST         'source'
+2120	LOAD_ATTR         'next'
+2123	LOAD_CONST        None
+2126	COMPARE_OP        'is'
+2129	POP_JUMP_IF_TRUE  '2147'
+2132	LOAD_FAST         'source'
+2135	LOAD_ATTR         'next'
+2138	LOAD_CONST        ')'
+2141	COMPARE_OP        '=='
+2144_0	COME_FROM         '2129'
+2144	POP_JUMP_IF_FALSE '2151'
+
+2147	BREAK_LOOP        None
+2148	JUMP_FORWARD      '2151'
+2151_0	COME_FROM         '2148'
+
+2151	LOAD_FAST         'sourceget'
+2154	CALL_FUNCTION_0   None
+2157	POP_TOP           None
+2158	JUMP_BACK         '2117'
+2161	POP_BLOCK         None
+2162_0	COME_FROM         '2114'
+
+2162	LOAD_FAST         'sourcematch'
+2165	LOAD_CONST        ')'
+2168	CALL_FUNCTION_1   None
+2171	POP_JUMP_IF_TRUE  '72'
+
+2174	LOAD_GLOBAL       'error'
+2177	LOAD_CONST        'unbalanced parenthesis'
+2180	RAISE_VARARGS_2   None
+2183	JUMP_BACK         '72'
+
+2186	CONTINUE          '72'
+2189	JUMP_ABSOLUTE     '2692'
+
+2192	LOAD_FAST         'source'
+2195	LOAD_ATTR         'next'
+2198	LOAD_FAST         'ASSERTCHARS'
+2201	COMPARE_OP        'in'
+2204	POP_JUMP_IF_FALSE '2383'
+
+2207	LOAD_FAST         'sourceget'
+2210	CALL_FUNCTION_0   None
+2213	STORE_FAST        'char'
+
+2216	LOAD_CONST        1
+2219	STORE_FAST        'dir'
+
+2222	LOAD_FAST         'char'
+2225	LOAD_CONST        '<'
+2228	COMPARE_OP        '=='
+2231	POP_JUMP_IF_FALSE '2279'
+
+2234	LOAD_FAST         'source'
+2237	LOAD_ATTR         'next'
+2240	LOAD_FAST         'LOOKBEHINDASSERTCHARS'
+2243	COMPARE_OP        'not in'
+2246	POP_JUMP_IF_FALSE '2261'
+
+2249	LOAD_GLOBAL       'error'
+2252	LOAD_CONST        'syntax error'
+2255	RAISE_VARARGS_2   None
+2258	JUMP_FORWARD      '2261'
+2261_0	COME_FROM         '2258'
+
+2261	LOAD_CONST        -1
+2264	STORE_FAST        'dir'
+
+2267	LOAD_FAST         'sourceget'
+2270	CALL_FUNCTION_0   None
+2273	STORE_FAST        'char'
+2276	JUMP_FORWARD      '2279'
+2279_0	COME_FROM         '2276'
+
+2279	LOAD_GLOBAL       '_parse_sub'
+2282	LOAD_FAST         'source'
+2285	LOAD_FAST         'state'
+2288	CALL_FUNCTION_2   None
+2291	STORE_FAST        'p'
+
+2294	LOAD_FAST         'sourcematch'
+2297	LOAD_CONST        ')'
+2300	CALL_FUNCTION_1   None
+2303	POP_JUMP_IF_TRUE  '2318'
+
+2306	LOAD_GLOBAL       'error'
+2309	LOAD_CONST        'unbalanced parenthesis'
+2312	RAISE_VARARGS_2   None
+2315	JUMP_FORWARD      '2318'
+2318_0	COME_FROM         '2315'
+
+2318	LOAD_FAST         'char'
+2321	LOAD_CONST        '='
+2324	COMPARE_OP        '=='
+2327	POP_JUMP_IF_FALSE '2355'
+
+2330	LOAD_FAST         'subpatternappend'
+2333	LOAD_GLOBAL       'ASSERT'
+2336	LOAD_FAST         'dir'
+2339	LOAD_FAST         'p'
+2342	BUILD_TUPLE_2     None
+2345	BUILD_TUPLE_2     None
+2348	CALL_FUNCTION_1   None
+2351	POP_TOP           None
+2352	JUMP_BACK         '72'
+
+2355	LOAD_FAST         'subpatternappend'
+2358	LOAD_GLOBAL       'ASSERT_NOT'
+2361	LOAD_FAST         'dir'
+2364	LOAD_FAST         'p'
+2367	BUILD_TUPLE_2     None
+2370	BUILD_TUPLE_2     None
+2373	CALL_FUNCTION_1   None
+2376	POP_TOP           None
+
+2377	CONTINUE          '72'
+2380	JUMP_ABSOLUTE     '2692'
+
+2383	LOAD_FAST         'sourcematch'
+2386	LOAD_CONST        '('
+2389	CALL_FUNCTION_1   None
+2392	POP_JUMP_IF_FALSE '2617'
+
+2395	LOAD_CONST        ''
+2398	STORE_FAST        'condname'
+
+2401	SETUP_LOOP        '2467'
+
+2404	LOAD_FAST         'sourceget'
+2407	CALL_FUNCTION_0   None
+2410	STORE_FAST        'char'
+
+2413	LOAD_FAST         'char'
+2416	LOAD_CONST        None
+2419	COMPARE_OP        'is'
+2422	POP_JUMP_IF_FALSE '2437'
+
+2425	LOAD_GLOBAL       'error'
+2428	LOAD_CONST        'unterminated name'
+2431	RAISE_VARARGS_2   None
+2434	JUMP_FORWARD      '2437'
+2437_0	COME_FROM         '2434'
+
+2437	LOAD_FAST         'char'
+2440	LOAD_CONST        ')'
+2443	COMPARE_OP        '=='
+2446	POP_JUMP_IF_FALSE '2453'
+
+2449	BREAK_LOOP        None
+2450	JUMP_FORWARD      '2453'
+2453_0	COME_FROM         '2450'
+
+2453	LOAD_FAST         'condname'
+2456	LOAD_FAST         'char'
+2459	BINARY_ADD        None
+2460	STORE_FAST        'condname'
+2463	JUMP_BACK         '2404'
+2466	POP_BLOCK         None
+2467_0	COME_FROM         '2401'
+
+2467	LOAD_CONST        2
+2470	STORE_FAST        'group'
+
+2473	LOAD_FAST         'condname'
+2476	POP_JUMP_IF_TRUE  '2494'
+
+2479	LOAD_GLOBAL       'error'
+2482	LOAD_CONST        'missing group name'
+2485	CALL_FUNCTION_1   None
+2488	RAISE_VARARGS_1   None
+2491	JUMP_FORWARD      '2494'
+2494_0	COME_FROM         '2491'
+
+2494	LOAD_GLOBAL       'isname'
+2497	LOAD_FAST         'condname'
+2500	CALL_FUNCTION_1   None
+2503	POP_JUMP_IF_FALSE '2569'
+
+2506	LOAD_FAST         'state'
+2509	LOAD_ATTR         'groupdict'
+2512	LOAD_ATTR         'get'
+2515	LOAD_FAST         'condname'
+2518	CALL_FUNCTION_1   None
+2521	STORE_FAST        'condgroup'
+
+2524	LOAD_FAST         'condgroup'
+2527	LOAD_CONST        None
+2530	COMPARE_OP        'is'
+2533	POP_JUMP_IF_FALSE '2614'
+
+2536	LOAD_CONST        'unknown group name: {0!r}'
+2539	LOAD_ATTR         'format'
+2542	LOAD_FAST         'condname'
+2545	CALL_FUNCTION_1   None
+2548	STORE_FAST        'msg'
+
+2551	LOAD_GLOBAL       'error'
+2554	LOAD_FAST         'msg'
+2557	CALL_FUNCTION_1   None
+2560	RAISE_VARARGS_1   None
+2563	JUMP_ABSOLUTE     '2614'
+2566	JUMP_ABSOLUTE     '2689'
+
+2569	SETUP_EXCEPT      '2588'
+
+2572	LOAD_GLOBAL       'int'
+2575	LOAD_FAST         'condname'
+2578	CALL_FUNCTION_1   None
+2581	STORE_FAST        'condgroup'
+2584	POP_BLOCK         None
+2585	JUMP_ABSOLUTE     '2689'
+2588_0	COME_FROM         '2569'
+
+2588	DUP_TOP           None
+2589	LOAD_GLOBAL       'ValueError'
+2592	COMPARE_OP        'exception match'
+2595	POP_JUMP_IF_FALSE '2613'
+2598	POP_TOP           None
+2599	POP_TOP           None
+2600	POP_TOP           None
+
+2601	LOAD_GLOBAL       'error'
+2604	LOAD_CONST        'bad character in group name'
+2607	RAISE_VARARGS_2   None
+2610	JUMP_ABSOLUTE     '2689'
+2613	END_FINALLY       None
+2614_0	COME_FROM         '2613'
+2614	JUMP_ABSOLUTE     '2692'
+
+2617	LOAD_FAST         'source'
+2620	LOAD_ATTR         'next'
+2623	LOAD_GLOBAL       'FLAGS'
+2626	COMPARE_OP        'not in'
+2629	POP_JUMP_IF_FALSE '2644'
+
+2632	LOAD_GLOBAL       'error'
+2635	LOAD_CONST        'unexpected end of pattern'
+2638	RAISE_VARARGS_2   None
+2641	JUMP_FORWARD      '2644'
+2644_0	COME_FROM         '2641'
+
+2644	SETUP_LOOP        '2692'
+2647	LOAD_FAST         'source'
+2650	LOAD_ATTR         'next'
+2653	LOAD_GLOBAL       'FLAGS'
+2656	COMPARE_OP        'in'
+2659	POP_JUMP_IF_FALSE '2688'
+
+2662	LOAD_FAST         'state'
+2665	LOAD_ATTR         'flags'
+2668	LOAD_GLOBAL       'FLAGS'
+2671	LOAD_FAST         'sourceget'
+2674	CALL_FUNCTION_0   None
+2677	BINARY_SUBSCR     None
+2678	BINARY_OR         None
+2679	LOAD_FAST         'state'
+2682	STORE_ATTR        'flags'
+2685	JUMP_BACK         '2647'
+2688	POP_BLOCK         None
+2689_0	COME_FROM         '2644'
+2689	JUMP_FORWARD      '2692'
+2692_0	COME_FROM         '2689'
+
+2692	LOAD_FAST         'group'
+2695	POP_JUMP_IF_FALSE '2853'
+
+2698	LOAD_FAST         'group'
+2701	LOAD_CONST        2
+2704	COMPARE_OP        '=='
+2707	POP_JUMP_IF_FALSE '2719'
+
+2710	LOAD_CONST        None
+2713	STORE_FAST        'group'
+2716	JUMP_FORWARD      '2734'
+
+2719	LOAD_FAST         'state'
+2722	LOAD_ATTR         'opengroup'
+2725	LOAD_FAST         'name'
+2728	CALL_FUNCTION_1   None
+2731	STORE_FAST        'group'
+2734_0	COME_FROM         '2716'
+
+2734	LOAD_FAST         'condgroup'
+2737	POP_JUMP_IF_FALSE '2761'
+
+2740	LOAD_GLOBAL       '_parse_sub_cond'
+2743	LOAD_FAST         'source'
+2746	LOAD_FAST         'state'
+2749	LOAD_FAST         'condgroup'
+2752	CALL_FUNCTION_3   None
+2755	STORE_FAST        'p'
+2758	JUMP_FORWARD      '2776'
+
+2761	LOAD_GLOBAL       '_parse_sub'
+2764	LOAD_FAST         'source'
+2767	LOAD_FAST         'state'
+2770	CALL_FUNCTION_2   None
+2773	STORE_FAST        'p'
+2776_0	COME_FROM         '2758'
+
+2776	LOAD_FAST         'sourcematch'
+2779	LOAD_CONST        ')'
+2782	CALL_FUNCTION_1   None
+2785	POP_JUMP_IF_TRUE  '2800'
+
+2788	LOAD_GLOBAL       'error'
+2791	LOAD_CONST        'unbalanced parenthesis'
+2794	RAISE_VARARGS_2   None
+2797	JUMP_FORWARD      '2800'
+2800_0	COME_FROM         '2797'
+
+2800	LOAD_FAST         'group'
+2803	LOAD_CONST        None
+2806	COMPARE_OP        'is not'
+2809	POP_JUMP_IF_FALSE '2828'
+
+2812	LOAD_FAST         'state'
+2815	LOAD_ATTR         'closegroup'
+2818	LOAD_FAST         'group'
+2821	CALL_FUNCTION_1   None
+2824	POP_TOP           None
+2825	JUMP_FORWARD      '2828'
+2828_0	COME_FROM         '2825'
+
+2828	LOAD_FAST         'subpatternappend'
+2831	LOAD_GLOBAL       'SUBPATTERN'
+2834	LOAD_FAST         'group'
+2837	LOAD_FAST         'p'
+2840	BUILD_TUPLE_2     None
+2843	BUILD_TUPLE_2     None
+2846	CALL_FUNCTION_1   None
+2849	POP_TOP           None
+2850	JUMP_ABSOLUTE     '3048'
+
+2853	SETUP_LOOP        '3048'
+
+2856	LOAD_FAST         'sourceget'
+2859	CALL_FUNCTION_0   None
+2862	STORE_FAST        'char'
+
+2865	LOAD_FAST         'char'
+2868	LOAD_CONST        None
+2871	COMPARE_OP        'is'
+2874	POP_JUMP_IF_FALSE '2889'
+
+2877	LOAD_GLOBAL       'error'
+2880	LOAD_CONST        'unexpected end of pattern'
+2883	RAISE_VARARGS_2   None
+2886	JUMP_FORWARD      '2889'
+2889_0	COME_FROM         '2886'
+
+2889	LOAD_FAST         'char'
+2892	LOAD_CONST        ')'
+2895	COMPARE_OP        '=='
+2898	POP_JUMP_IF_FALSE '2905'
+
+2901	BREAK_LOOP        None
+2902	JUMP_FORWARD      '2905'
+2905_0	COME_FROM         '2902'
+
+2905	LOAD_GLOBAL       'error'
+2908	LOAD_CONST        'unknown extension'
+2911	RAISE_VARARGS_2   None
+2914	JUMP_BACK         '2856'
+2917	POP_BLOCK         None
+2918_0	COME_FROM         '2853'
+2918	JUMP_BACK         '72'
+
+2921	LOAD_FAST         'this'
+2924	LOAD_CONST        '^'
+2927	COMPARE_OP        '=='
+2930	POP_JUMP_IF_FALSE '2952'
+
+2933	LOAD_FAST         'subpatternappend'
+2936	LOAD_GLOBAL       'AT'
+2939	LOAD_GLOBAL       'AT_BEGINNING'
+2942	BUILD_TUPLE_2     None
+2945	CALL_FUNCTION_1   None
+2948	POP_TOP           None
+2949	JUMP_BACK         '72'
+
+2952	LOAD_FAST         'this'
+2955	LOAD_CONST        '$'
+2958	COMPARE_OP        '=='
+2961	POP_JUMP_IF_FALSE '2986'
+
+2964	LOAD_FAST         'subpattern'
+2967	LOAD_ATTR         'append'
+2970	LOAD_GLOBAL       'AT'
+2973	LOAD_GLOBAL       'AT_END'
+2976	BUILD_TUPLE_2     None
+2979	CALL_FUNCTION_1   None
+2982	POP_TOP           None
+2983	JUMP_BACK         '72'
+
+2986	LOAD_FAST         'this'
+2989	POP_JUMP_IF_FALSE '3039'
+2992	LOAD_FAST         'this'
+2995	LOAD_CONST        0
+2998	BINARY_SUBSCR     None
+2999	LOAD_CONST        '\\'
+3002	COMPARE_OP        '=='
+3005_0	COME_FROM         '2989'
+3005	POP_JUMP_IF_FALSE '3039'
+
+3008	LOAD_GLOBAL       '_escape'
+3011	LOAD_FAST         'source'
+3014	LOAD_FAST         'this'
+3017	LOAD_FAST         'state'
+3020	CALL_FUNCTION_3   None
+3023	STORE_FAST        'code'
+
+3026	LOAD_FAST         'subpatternappend'
+3029	LOAD_FAST         'code'
+3032	CALL_FUNCTION_1   None
+3035	POP_TOP           None
+3036	JUMP_BACK         '72'
+
+3039	LOAD_GLOBAL       'error'
+3042	LOAD_CONST        'parser error'
+3045	RAISE_VARARGS_2   None
+3048	JUMP_BACK         '72'
+3051	POP_BLOCK         None
+3052_0	COME_FROM         '69'
+
+3052	LOAD_FAST         'subpattern'
+3055	RETURN_VALUE      None
+
+Syntax error at or near `POP_BLOCK' token at offset 190
+
+
+def parse(str, flags = 0, pattern = None):
+    source = Tokenizer(str)
+    if pattern is None:
+        pattern = Pattern()
+    pattern.flags = flags
+    pattern.str = str
+    p = _parse_sub(source, pattern, 0)
+    tail = source.get()
+    if tail == ')':
+        raise error, 'unbalanced parenthesis'
+    elif tail:
+        raise error, 'bogus characters at end of regular expression'
+    if flags & SRE_FLAG_DEBUG:
+        p.dump()
+    if not flags & SRE_FLAG_VERBOSE and p.pattern.flags & SRE_FLAG_VERBOSE:
+        return parse(str, p.pattern.flags)
+    else:
+        return p
+
+
+def parse_template--- This code section failed: ---
+
+0	LOAD_GLOBAL       'Tokenizer'
+3	LOAD_FAST         'source'
+6	CALL_FUNCTION_1   None
+9	STORE_FAST        's'
+
+12	LOAD_FAST         's'
+15	LOAD_ATTR         'get'
+18	STORE_FAST        'sget'
+
+21	BUILD_LIST_0      None
+24	STORE_FAST        'p'
+
+27	LOAD_FAST         'p'
+30	LOAD_ATTR         'append'
+33	STORE_FAST        'a'
+
+36	LOAD_FAST         'p'
+39	LOAD_FAST         'a'
+42	LOAD_CONST        '<code_object literal>'
+45	MAKE_FUNCTION_2   None
+48	STORE_FAST        'literal'
+
+51	LOAD_FAST         'source'
+54	LOAD_CONST        0
+57	SLICE+2           None
+58	STORE_FAST        'sep'
+
+61	LOAD_GLOBAL       'type'
+64	LOAD_FAST         'sep'
+67	CALL_FUNCTION_1   None
+70	LOAD_GLOBAL       'type'
+73	LOAD_CONST        ''
+76	CALL_FUNCTION_1   None
+79	COMPARE_OP        'is'
+82	POP_JUMP_IF_FALSE '94'
+
+85	LOAD_GLOBAL       'chr'
+88	STORE_FAST        'makechar'
+91	JUMP_FORWARD      '100'
+
+94	LOAD_GLOBAL       'unichr'
+97	STORE_FAST        'makechar'
+100_0	COME_FROM         '91'
+
+100	SETUP_LOOP        '816'
+
+103	LOAD_FAST         'sget'
+106	CALL_FUNCTION_0   None
+109	STORE_FAST        'this'
+
+112	LOAD_FAST         'this'
+115	LOAD_CONST        None
+118	COMPARE_OP        'is'
+121	POP_JUMP_IF_FALSE '128'
+
+124	BREAK_LOOP        None
+125	JUMP_FORWARD      '128'
+128_0	COME_FROM         '125'
+
+128	LOAD_FAST         'this'
+131	POP_JUMP_IF_FALSE '802'
+134	LOAD_FAST         'this'
+137	LOAD_CONST        0
+140	BINARY_SUBSCR     None
+141	LOAD_CONST        '\\'
+144	COMPARE_OP        '=='
+147_0	COME_FROM         '131'
+147	POP_JUMP_IF_FALSE '802'
+
+150	LOAD_FAST         'this'
+153	LOAD_CONST        1
+156	LOAD_CONST        2
+159	SLICE+3           None
+160	STORE_FAST        'c'
+
+163	LOAD_FAST         'c'
+166	LOAD_CONST        'g'
+169	COMPARE_OP        '=='
+172	POP_JUMP_IF_FALSE '450'
+
+175	LOAD_CONST        ''
+178	STORE_FAST        'name'
+
+181	LOAD_FAST         's'
+184	LOAD_ATTR         'match'
+187	LOAD_CONST        '<'
+190	CALL_FUNCTION_1   None
+193	POP_JUMP_IF_FALSE '265'
+
+196	SETUP_LOOP        '265'
+
+199	LOAD_FAST         'sget'
+202	CALL_FUNCTION_0   None
+205	STORE_FAST        'char'
+
+208	LOAD_FAST         'char'
+211	LOAD_CONST        None
+214	COMPARE_OP        'is'
+217	POP_JUMP_IF_FALSE '232'
+
+220	LOAD_GLOBAL       'error'
+223	LOAD_CONST        'unterminated group name'
+226	RAISE_VARARGS_2   None
+229	JUMP_FORWARD      '232'
+232_0	COME_FROM         '229'
+
+232	LOAD_FAST         'char'
+235	LOAD_CONST        '>'
+238	COMPARE_OP        '=='
+241	POP_JUMP_IF_FALSE '248'
+
+244	BREAK_LOOP        None
+245	JUMP_FORWARD      '248'
+248_0	COME_FROM         '245'
+
+248	LOAD_FAST         'name'
+251	LOAD_FAST         'char'
+254	BINARY_ADD        None
+255	STORE_FAST        'name'
+258	JUMP_BACK         '199'
+261	POP_BLOCK         None
+262_0	COME_FROM         '196'
+262	JUMP_FORWARD      '265'
+265_0	COME_FROM         '262'
+
+265	LOAD_FAST         'name'
+268	POP_JUMP_IF_TRUE  '283'
+
+271	LOAD_GLOBAL       'error'
+274	LOAD_CONST        'missing group name'
+277	RAISE_VARARGS_2   None
+280	JUMP_FORWARD      '283'
+283_0	COME_FROM         '280'
+
+283	SETUP_EXCEPT      '326'
+
+286	LOAD_GLOBAL       'int'
+289	LOAD_FAST         'name'
+292	CALL_FUNCTION_1   None
+295	STORE_FAST        'index'
+
+298	LOAD_FAST         'index'
+301	LOAD_CONST        0
+304	COMPARE_OP        '<'
+307	POP_JUMP_IF_FALSE '322'
+
+310	LOAD_GLOBAL       'error'
+313	LOAD_CONST        'negative group number'
+316	RAISE_VARARGS_2   None
+319	JUMP_FORWARD      '322'
+322_0	COME_FROM         '319'
+322	POP_BLOCK         None
+323	JUMP_FORWARD      '431'
+326_0	COME_FROM         '283'
+
+326	DUP_TOP           None
+327	LOAD_GLOBAL       'ValueError'
+330	COMPARE_OP        'exception match'
+333	POP_JUMP_IF_FALSE '430'
+336	POP_TOP           None
+337	POP_TOP           None
+338	POP_TOP           None
+
+339	LOAD_GLOBAL       'isname'
+342	LOAD_FAST         'name'
+345	CALL_FUNCTION_1   None
+348	POP_JUMP_IF_TRUE  '363'
+
+351	LOAD_GLOBAL       'error'
+354	LOAD_CONST        'bad character in group name'
+357	RAISE_VARARGS_2   None
+360	JUMP_FORWARD      '363'
+363_0	COME_FROM         '360'
+
+363	SETUP_EXCEPT      '383'
+
+366	LOAD_FAST         'pattern'
+369	LOAD_ATTR         'groupindex'
+372	LOAD_FAST         'name'
+375	BINARY_SUBSCR     None
+376	STORE_FAST        'index'
+379	POP_BLOCK         None
+380	JUMP_ABSOLUTE     '431'
+383_0	COME_FROM         '363'
+
+383	DUP_TOP           None
+384	LOAD_GLOBAL       'KeyError'
+387	COMPARE_OP        'exception match'
+390	POP_JUMP_IF_FALSE '426'
+393	POP_TOP           None
+394	POP_TOP           None
+395	POP_TOP           None
+
+396	LOAD_CONST        'unknown group name: {0!r}'
+399	LOAD_ATTR         'format'
+402	LOAD_FAST         'name'
+405	CALL_FUNCTION_1   None
+408	STORE_FAST        'msg'
+
+411	LOAD_GLOBAL       'IndexError'
+414	LOAD_FAST         'msg'
+417	CALL_FUNCTION_1   None
+420	RAISE_VARARGS_1   None
+423	JUMP_ABSOLUTE     '431'
+426	END_FINALLY       None
+427_0	COME_FROM         '426'
+427	JUMP_FORWARD      '431'
+430	END_FINALLY       None
+431_0	COME_FROM         '323'
+431_1	COME_FROM         '430'
+
+431	LOAD_FAST         'a'
+434	LOAD_GLOBAL       'MARK'
+437	LOAD_FAST         'index'
+440	BUILD_TUPLE_2     None
+443	CALL_FUNCTION_1   None
+446	POP_TOP           None
+447	JUMP_ABSOLUTE     '812'
+
+450	LOAD_FAST         'c'
+453	LOAD_CONST        '0'
+456	COMPARE_OP        '=='
+459	POP_JUMP_IF_FALSE '560'
+
+462	LOAD_FAST         's'
+465	LOAD_ATTR         'next'
+468	LOAD_GLOBAL       'OCTDIGITS'
+471	COMPARE_OP        'in'
+474	POP_JUMP_IF_FALSE '524'
+
+477	LOAD_FAST         'this'
+480	LOAD_FAST         'sget'
+483	CALL_FUNCTION_0   None
+486	BINARY_ADD        None
+487	STORE_FAST        'this'
+
+490	LOAD_FAST         's'
+493	LOAD_ATTR         'next'
+496	LOAD_GLOBAL       'OCTDIGITS'
+499	COMPARE_OP        'in'
+502	POP_JUMP_IF_FALSE '524'
+
+505	LOAD_FAST         'this'
+508	LOAD_FAST         'sget'
+511	CALL_FUNCTION_0   None
+514	BINARY_ADD        None
+515	STORE_FAST        'this'
+518	JUMP_ABSOLUTE     '524'
+521	JUMP_FORWARD      '524'
+524_0	COME_FROM         '521'
+
+524	LOAD_FAST         'literal'
+527	LOAD_FAST         'makechar'
+530	LOAD_GLOBAL       'int'
+533	LOAD_FAST         'this'
+536	LOAD_CONST        1
+539	SLICE+1           None
+540	LOAD_CONST        8
+543	CALL_FUNCTION_2   None
+546	LOAD_CONST        255
+549	BINARY_AND        None
+550	CALL_FUNCTION_1   None
+553	CALL_FUNCTION_1   None
+556	POP_TOP           None
+557	JUMP_ABSOLUTE     '812'
+
+560	LOAD_FAST         'c'
+563	LOAD_GLOBAL       'DIGITS'
+566	COMPARE_OP        'in'
+569	POP_JUMP_IF_FALSE '745'
+
+572	LOAD_GLOBAL       'False'
+575	STORE_FAST        'isoctal'
+
+578	LOAD_FAST         's'
+581	LOAD_ATTR         'next'
+584	LOAD_GLOBAL       'DIGITS'
+587	COMPARE_OP        'in'
+590	POP_JUMP_IF_FALSE '707'
+
+593	LOAD_FAST         'this'
+596	LOAD_FAST         'sget'
+599	CALL_FUNCTION_0   None
+602	BINARY_ADD        None
+603	STORE_FAST        'this'
+
+606	LOAD_FAST         'c'
+609	LOAD_GLOBAL       'OCTDIGITS'
+612	COMPARE_OP        'in'
+615	POP_JUMP_IF_FALSE '707'
+618	LOAD_FAST         'this'
+621	LOAD_CONST        2
+624	BINARY_SUBSCR     None
+625	LOAD_GLOBAL       'OCTDIGITS'
+628	COMPARE_OP        'in'
+631_0	COME_FROM         '615'
+631	POP_JUMP_IF_FALSE '707'
+
+634	LOAD_FAST         's'
+637	LOAD_ATTR         'next'
+640	LOAD_GLOBAL       'OCTDIGITS'
+643	COMPARE_OP        'in'
+646_0	COME_FROM         '631'
+646	POP_JUMP_IF_FALSE '707'
+
+649	LOAD_FAST         'this'
+652	LOAD_FAST         'sget'
+655	CALL_FUNCTION_0   None
+658	BINARY_ADD        None
+659	STORE_FAST        'this'
+
+662	LOAD_GLOBAL       'True'
+665	STORE_FAST        'isoctal'
+
+668	LOAD_FAST         'literal'
+671	LOAD_FAST         'makechar'
+674	LOAD_GLOBAL       'int'
+677	LOAD_FAST         'this'
+680	LOAD_CONST        1
+683	SLICE+1           None
+684	LOAD_CONST        8
+687	CALL_FUNCTION_2   None
+690	LOAD_CONST        255
+693	BINARY_AND        None
+694	CALL_FUNCTION_1   None
+697	CALL_FUNCTION_1   None
+700	POP_TOP           None
+701	JUMP_ABSOLUTE     '707'
+704	JUMP_FORWARD      '707'
+707_0	COME_FROM         '704'
+
+707	LOAD_FAST         'isoctal'
+710	POP_JUMP_IF_TRUE  '799'
+
+713	LOAD_FAST         'a'
+716	LOAD_GLOBAL       'MARK'
+719	LOAD_GLOBAL       'int'
+722	LOAD_FAST         'this'
+725	LOAD_CONST        1
+728	SLICE+1           None
+729	CALL_FUNCTION_1   None
+732	BUILD_TUPLE_2     None
+735	CALL_FUNCTION_1   None
+738	POP_TOP           None
+739	JUMP_ABSOLUTE     '799'
+742	JUMP_ABSOLUTE     '812'
+
+745	SETUP_EXCEPT      '772'
+
+748	LOAD_FAST         'makechar'
+751	LOAD_GLOBAL       'ESCAPES'
+754	LOAD_FAST         'this'
+757	BINARY_SUBSCR     None
+758	LOAD_CONST        1
+761	BINARY_SUBSCR     None
+762	CALL_FUNCTION_1   None
+765	STORE_FAST        'this'
+768	POP_BLOCK         None
+769	JUMP_FORWARD      '789'
+772_0	COME_FROM         '745'
+
+772	DUP_TOP           None
+773	LOAD_GLOBAL       'KeyError'
+776	COMPARE_OP        'exception match'
+779	POP_JUMP_IF_FALSE '788'
+782	POP_TOP           None
+783	POP_TOP           None
+784	POP_TOP           None
+
+785	JUMP_FORWARD      '789'
+788	END_FINALLY       None
+789_0	COME_FROM         '769'
+789_1	COME_FROM         '788'
+
+789	LOAD_FAST         'literal'
+792	LOAD_FAST         'this'
+795	CALL_FUNCTION_1   None
+798	POP_TOP           None
+799	JUMP_BACK         '103'
+
+802	LOAD_FAST         'literal'
+805	LOAD_FAST         'this'
+808	CALL_FUNCTION_1   None
+811	POP_TOP           None
+812	JUMP_BACK         '103'
+815	POP_BLOCK         None
+816_0	COME_FROM         '100'
+
+816	LOAD_CONST        0
+819	STORE_FAST        'i'
+
+822	BUILD_LIST_0      None
+825	STORE_FAST        'groups'
+
+828	LOAD_FAST         'groups'
+831	LOAD_ATTR         'append'
+834	STORE_FAST        'groupsappend'
+
+837	LOAD_CONST        None
+840	BUILD_LIST_1      None
+843	LOAD_GLOBAL       'len'
+846	LOAD_FAST         'p'
+849	CALL_FUNCTION_1   None
+852	BINARY_MULTIPLY   None
+853	STORE_FAST        'literals'
+
+856	SETUP_LOOP        '930'
+859	LOAD_FAST         'p'
+862	GET_ITER          None
+863	FOR_ITER          '929'
+866	UNPACK_SEQUENCE_2 None
+869	STORE_FAST        'c'
+872	STORE_FAST        's'
+
+875	LOAD_FAST         'c'
+878	LOAD_GLOBAL       'MARK'
+881	COMPARE_OP        'is'
+884	POP_JUMP_IF_FALSE '906'
+
+887	LOAD_FAST         'groupsappend'
+890	LOAD_FAST         'i'
+893	LOAD_FAST         's'
+896	BUILD_TUPLE_2     None
+899	CALL_FUNCTION_1   None
+902	POP_TOP           None
+903	JUMP_FORWARD      '916'
+
+906	LOAD_FAST         's'
+909	LOAD_FAST         'literals'
+912	LOAD_FAST         'i'
+915	STORE_SUBSCR      None
+916_0	COME_FROM         '903'
+
+916	LOAD_FAST         'i'
+919	LOAD_CONST        1
+922	BINARY_ADD        None
+923	STORE_FAST        'i'
+926	JUMP_BACK         '863'
+929	POP_BLOCK         None
+930_0	COME_FROM         '856'
+
+930	LOAD_FAST         'groups'
+933	LOAD_FAST         'literals'
+936	BUILD_TUPLE_2     None
+939	RETURN_VALUE      None
+
+Syntax error at or near `POP_BLOCK' token at offset 261
+
+
+def expand_template(template, match):
+    g = match.group
+    sep = match.string[:0]
+    groups, literals = template
+    literals = literals[:]
+    try:
+        for index, group in groups:
+            literals[index] = s = g(group)
+            if s is None:
+                raise error, 'unmatched group'
+
+    except IndexError:
+        raise error, 'invalid group reference'
+
+    return sep.join(literals)

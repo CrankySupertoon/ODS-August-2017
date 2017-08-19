@@ -1,0 +1,1072 @@
+# Fuck you Disyer. Stealing my fucking paypal. GET FUCKED: tokenize
+__author__ = 'Ka-Ping Yee <ping@lfw.org>'
+__credits__ = 'GvR, ESR, Tim Peters, Thomas Wouters, Fred Drake, Skip Montanaro, Raymond Hettinger'
+from itertools import chain
+import string, re
+from token import *
+import token
+__all__ = [ x for x in dir(token) if not x.startswith('_') ]
+__all__ += ['COMMENT',
+ 'tokenize',
+ 'generate_tokens',
+ 'NL',
+ 'untokenize']
+del x
+del token
+COMMENT = N_TOKENS
+tok_name[COMMENT] = 'COMMENT'
+NL = N_TOKENS + 1
+tok_name[NL] = 'NL'
+N_TOKENS += 2
+
+def group(*choices):
+    return '(' + '|'.join(choices) + ')'
+
+
+def any(*choices):
+    return group(*choices) + '*'
+
+
+def maybe(*choices):
+    return group(*choices) + '?'
+
+
+Whitespace = '[ \\f\\t]*'
+Comment = '#[^\\r\\n]*'
+Ignore = Whitespace + any('\\\\\\r?\\n' + Whitespace) + maybe(Comment)
+Name = '[a-zA-Z_]\\w*'
+Hexnumber = '0[xX][\\da-fA-F]+[lL]?'
+Octnumber = '(0[oO][0-7]+)|(0[0-7]*)[lL]?'
+Binnumber = '0[bB][01]+[lL]?'
+Decnumber = '[1-9]\\d*[lL]?'
+Intnumber = group(Hexnumber, Binnumber, Octnumber, Decnumber)
+Exponent = '[eE][-+]?\\d+'
+Pointfloat = group('\\d+\\.\\d*', '\\.\\d+') + maybe(Exponent)
+Expfloat = '\\d+' + Exponent
+Floatnumber = group(Pointfloat, Expfloat)
+Imagnumber = group('\\d+[jJ]', Floatnumber + '[jJ]')
+Number = group(Imagnumber, Floatnumber, Intnumber)
+Single = "[^'\\\\]*(?:\\\\.[^'\\\\]*)*'"
+Double = '[^"\\\\]*(?:\\\\.[^"\\\\]*)*"'
+Single3 = "[^'\\\\]*(?:(?:\\\\.|'(?!''))[^'\\\\]*)*'''"
+Double3 = '[^"\\\\]*(?:(?:\\\\.|"(?!""))[^"\\\\]*)*"""'
+Triple = group("[uUbB]?[rR]?'''", '[uUbB]?[rR]?"""')
+String = group("[uUbB]?[rR]?'[^\\n'\\\\]*(?:\\\\.[^\\n'\\\\]*)*'", '[uUbB]?[rR]?"[^\\n"\\\\]*(?:\\\\.[^\\n"\\\\]*)*"')
+Operator = group('\\*\\*=?', '>>=?', '<<=?', '<>', '!=', '//=?', '[+\\-*/%&|^=<>]=?', '~')
+Bracket = '[][(){}]'
+Special = group('\\r?\\n', '[:;.,`@]')
+Funny = group(Operator, Bracket, Special)
+PlainToken = group(Number, Funny, String, Name)
+Token = Ignore + PlainToken
+ContStr = group("[uUbB]?[rR]?'[^\\n'\\\\]*(?:\\\\.[^\\n'\\\\]*)*" + group("'", '\\\\\\r?\\n'), '[uUbB]?[rR]?"[^\\n"\\\\]*(?:\\\\.[^\\n"\\\\]*)*' + group('"', '\\\\\\r?\\n'))
+PseudoExtras = group('\\\\\\r?\\n|\\Z', Comment, Triple)
+PseudoToken = Whitespace + group(PseudoExtras, Number, Funny, ContStr, Name)
+tokenprog, pseudoprog, single3prog, double3prog = map(re.compile, (Token,
+ PseudoToken,
+ Single3,
+ Double3))
+endprogs = {"'": re.compile(Single),
+ '"': re.compile(Double),
+ "'''": single3prog,
+ '"""': double3prog,
+ "r'''": single3prog,
+ 'r"""': double3prog,
+ "u'''": single3prog,
+ 'u"""': double3prog,
+ "ur'''": single3prog,
+ 'ur"""': double3prog,
+ "R'''": single3prog,
+ 'R"""': double3prog,
+ "U'''": single3prog,
+ 'U"""': double3prog,
+ "uR'''": single3prog,
+ 'uR"""': double3prog,
+ "Ur'''": single3prog,
+ 'Ur"""': double3prog,
+ "UR'''": single3prog,
+ 'UR"""': double3prog,
+ "b'''": single3prog,
+ 'b"""': double3prog,
+ "br'''": single3prog,
+ 'br"""': double3prog,
+ "B'''": single3prog,
+ 'B"""': double3prog,
+ "bR'''": single3prog,
+ 'bR"""': double3prog,
+ "Br'''": single3prog,
+ 'Br"""': double3prog,
+ "BR'''": single3prog,
+ 'BR"""': double3prog,
+ 'r': None,
+ 'R': None,
+ 'u': None,
+ 'U': None,
+ 'b': None,
+ 'B': None}
+triple_quoted = {}
+for t in ("'''", '"""', "r'''", 'r"""', "R'''", 'R"""', "u'''", 'u"""', "U'''", 'U"""', "ur'''", 'ur"""', "Ur'''", 'Ur"""', "uR'''", 'uR"""', "UR'''", 'UR"""', "b'''", 'b"""', "B'''", 'B"""', "br'''", 'br"""', "Br'''", 'Br"""', "bR'''", 'bR"""', "BR'''", 'BR"""'):
+    triple_quoted[t] = t
+
+single_quoted = {}
+for t in ("'", '"', "r'", 'r"', "R'", 'R"', "u'", 'u"', "U'", 'U"', "ur'", 'ur"', "Ur'", 'Ur"', "uR'", 'uR"', "UR'", 'UR"', "b'", 'b"', "B'", 'B"', "br'", 'br"', "Br'", 'Br"', "bR'", 'bR"', "BR'", 'BR"'):
+    single_quoted[t] = t
+
+tabsize = 8
+
+class TokenError(Exception):
+    pass
+
+
+class StopTokenizing(Exception):
+    pass
+
+
+def printtoken(type, token, srow_scol, erow_ecol, line):
+    srow, scol = srow_scol
+    erow, ecol = erow_ecol
+    print '%d,%d-%d,%d:\t%s\t%s' % (srow,
+     scol,
+     erow,
+     ecol,
+     tok_name[type],
+     repr(token))
+
+
+def tokenize(readline, tokeneater = printtoken):
+    try:
+        tokenize_loop(readline, tokeneater)
+    except StopTokenizing:
+        pass
+
+
+def tokenize_loop(readline, tokeneater):
+    for token_info in generate_tokens(readline):
+        tokeneater(*token_info)
+
+
+class Untokenizer:
+
+    def __init__(self):
+        self.tokens = []
+        self.prev_row = 1
+        self.prev_col = 0
+
+    def add_whitespace(self, start):
+        row, col = start
+        if row < self.prev_row or row == self.prev_row and col < self.prev_col:
+            raise ValueError('start ({},{}) precedes previous end ({},{})'.format(row, col, self.prev_row, self.prev_col))
+        row_offset = row - self.prev_row
+        if row_offset:
+            self.tokens.append('\\\n' * row_offset)
+            self.prev_col = 0
+        col_offset = col - self.prev_col
+        if col_offset:
+            self.tokens.append(' ' * col_offset)
+
+    def untokenize(self, iterable):
+        it = iter(iterable)
+        for t in it:
+            if len(t) == 2:
+                self.compat(t, it)
+                break
+            tok_type, token, start, end, line = t
+            if tok_type == ENDMARKER:
+                break
+            self.add_whitespace(start)
+            self.tokens.append(token)
+            self.prev_row, self.prev_col = end
+            if tok_type in (NEWLINE, NL):
+                self.prev_row += 1
+                self.prev_col = 0
+
+        return ''.join(self.tokens)
+
+    def compat(self, token, iterable):
+        indents = []
+        toks_append = self.tokens.append
+        startline = token[0] in (NEWLINE, NL)
+        prevstring = False
+        for tok in chain([token], iterable):
+            toknum, tokval = tok[:2]
+            if toknum in (NAME, NUMBER):
+                tokval += ' '
+            if toknum == STRING:
+                if prevstring:
+                    tokval = ' ' + tokval
+                prevstring = True
+            else:
+                prevstring = False
+            if toknum == INDENT:
+                indents.append(tokval)
+                continue
+            elif toknum == DEDENT:
+                indents.pop()
+                continue
+            elif toknum in (NEWLINE, NL):
+                startline = True
+            elif startline and indents:
+                toks_append(indents[-1])
+                startline = False
+            toks_append(tokval)
+
+
+def untokenize(iterable):
+    ut = Untokenizer()
+    return ut.untokenize(iterable)
+
+
+def generate_tokens--- This code section failed: ---
+
+0	LOAD_CONST        0
+3	DUP_TOP           None
+4	STORE_FAST        'lnum'
+7	DUP_TOP           None
+8	STORE_FAST        'parenlev'
+11	STORE_FAST        'continued'
+
+14	LOAD_GLOBAL       'string'
+17	LOAD_ATTR         'ascii_letters'
+20	LOAD_CONST        '_'
+23	BINARY_ADD        None
+24	LOAD_CONST        '0123456789'
+27	ROT_TWO           None
+28	STORE_FAST        'namechars'
+31	STORE_FAST        'numchars'
+
+34	LOAD_CONST        ('', 0)
+37	UNPACK_SEQUENCE_2 None
+40	STORE_FAST        'contstr'
+43	STORE_FAST        'needcont'
+
+46	LOAD_CONST        None
+49	STORE_FAST        'contline'
+
+52	LOAD_CONST        0
+55	BUILD_LIST_1      None
+58	STORE_FAST        'indents'
+
+61	SETUP_LOOP        '1750'
+
+64	SETUP_EXCEPT      '80'
+
+67	LOAD_FAST         'readline'
+70	CALL_FUNCTION_0   None
+73	STORE_FAST        'line'
+76	POP_BLOCK         None
+77	JUMP_FORWARD      '103'
+80_0	COME_FROM         '64'
+
+80	DUP_TOP           None
+81	LOAD_GLOBAL       'StopIteration'
+84	COMPARE_OP        'exception match'
+87	POP_JUMP_IF_FALSE '102'
+90	POP_TOP           None
+91	POP_TOP           None
+92	POP_TOP           None
+
+93	LOAD_CONST        ''
+96	STORE_FAST        'line'
+99	JUMP_FORWARD      '103'
+102	END_FINALLY       None
+103_0	COME_FROM         '77'
+103_1	COME_FROM         '102'
+
+103	LOAD_FAST         'lnum'
+106	LOAD_CONST        1
+109	INPLACE_ADD       None
+110	STORE_FAST        'lnum'
+
+113	LOAD_CONST        0
+116	LOAD_GLOBAL       'len'
+119	LOAD_FAST         'line'
+122	CALL_FUNCTION_1   None
+125	ROT_TWO           None
+126	STORE_FAST        'pos'
+129	STORE_FAST        'max'
+
+132	LOAD_FAST         'contstr'
+135	POP_JUMP_IF_FALSE '379'
+
+138	LOAD_FAST         'line'
+141	POP_JUMP_IF_TRUE  '162'
+
+144	LOAD_GLOBAL       'TokenError'
+147	LOAD_CONST        'EOF in multi-line string'
+150	LOAD_FAST         'strstart'
+153	BUILD_TUPLE_2     None
+156	RAISE_VARARGS_2   None
+159	JUMP_FORWARD      '162'
+162_0	COME_FROM         '159'
+
+162	LOAD_FAST         'endprog'
+165	LOAD_ATTR         'match'
+168	LOAD_FAST         'line'
+171	CALL_FUNCTION_1   None
+174	STORE_FAST        'endmatch'
+
+177	LOAD_FAST         'endmatch'
+180	POP_JUMP_IF_FALSE '261'
+
+183	LOAD_FAST         'endmatch'
+186	LOAD_ATTR         'end'
+189	LOAD_CONST        0
+192	CALL_FUNCTION_1   None
+195	DUP_TOP           None
+196	STORE_FAST        'pos'
+199	STORE_FAST        'end'
+
+202	LOAD_GLOBAL       'STRING'
+205	LOAD_FAST         'contstr'
+208	LOAD_FAST         'line'
+211	LOAD_FAST         'end'
+214	SLICE+2           None
+215	BINARY_ADD        None
+
+216	LOAD_FAST         'strstart'
+219	LOAD_FAST         'lnum'
+222	LOAD_FAST         'end'
+225	BUILD_TUPLE_2     None
+228	LOAD_FAST         'contline'
+231	LOAD_FAST         'line'
+234	BINARY_ADD        None
+235	BUILD_TUPLE_5     None
+238	YIELD_VALUE       None
+239	POP_TOP           None
+
+240	LOAD_CONST        ('', 0)
+243	UNPACK_SEQUENCE_2 None
+246	STORE_FAST        'contstr'
+249	STORE_FAST        'needcont'
+
+252	LOAD_CONST        None
+255	STORE_FAST        'contline'
+258	JUMP_ABSOLUTE     '987'
+
+261	LOAD_FAST         'needcont'
+264	POP_JUMP_IF_FALSE '353'
+267	LOAD_FAST         'line'
+270	LOAD_CONST        -2
+273	SLICE+1           None
+274	LOAD_CONST        '\\\n'
+277	COMPARE_OP        '!='
+280	POP_JUMP_IF_FALSE '353'
+283	LOAD_FAST         'line'
+286	LOAD_CONST        -3
+289	SLICE+1           None
+290	LOAD_CONST        '\\\r\n'
+293	COMPARE_OP        '!='
+296_0	COME_FROM         '264'
+296_1	COME_FROM         '280'
+296	POP_JUMP_IF_FALSE '353'
+
+299	LOAD_GLOBAL       'ERRORTOKEN'
+302	LOAD_FAST         'contstr'
+305	LOAD_FAST         'line'
+308	BINARY_ADD        None
+
+309	LOAD_FAST         'strstart'
+312	LOAD_FAST         'lnum'
+315	LOAD_GLOBAL       'len'
+318	LOAD_FAST         'line'
+321	CALL_FUNCTION_1   None
+324	BUILD_TUPLE_2     None
+327	LOAD_FAST         'contline'
+330	BUILD_TUPLE_5     None
+333	YIELD_VALUE       None
+334	POP_TOP           None
+
+335	LOAD_CONST        ''
+338	STORE_FAST        'contstr'
+
+341	LOAD_CONST        None
+344	STORE_FAST        'contline'
+
+347	CONTINUE          '64'
+350	JUMP_ABSOLUTE     '987'
+
+353	LOAD_FAST         'contstr'
+356	LOAD_FAST         'line'
+359	BINARY_ADD        None
+360	STORE_FAST        'contstr'
+
+363	LOAD_FAST         'contline'
+366	LOAD_FAST         'line'
+369	BINARY_ADD        None
+370	STORE_FAST        'contline'
+
+373	CONTINUE          '64'
+376	JUMP_FORWARD      '987'
+
+379	LOAD_FAST         'parenlev'
+382	LOAD_CONST        0
+385	COMPARE_OP        '=='
+388	POP_JUMP_IF_FALSE '951'
+391	LOAD_FAST         'continued'
+394	UNARY_NOT         None
+395_0	COME_FROM         '388'
+395	POP_JUMP_IF_FALSE '951'
+
+398	LOAD_FAST         'line'
+401	POP_JUMP_IF_TRUE  '408'
+404	BREAK_LOOP        None
+405	JUMP_FORWARD      '408'
+408_0	COME_FROM         '405'
+
+408	LOAD_CONST        0
+411	STORE_FAST        'column'
+
+414	SETUP_LOOP        '535'
+417	LOAD_FAST         'pos'
+420	LOAD_FAST         'max'
+423	COMPARE_OP        '<'
+426	POP_JUMP_IF_FALSE '534'
+
+429	LOAD_FAST         'line'
+432	LOAD_FAST         'pos'
+435	BINARY_SUBSCR     None
+436	LOAD_CONST        ' '
+439	COMPARE_OP        '=='
+442	POP_JUMP_IF_FALSE '458'
+
+445	LOAD_FAST         'column'
+448	LOAD_CONST        1
+451	INPLACE_ADD       None
+452	STORE_FAST        'column'
+455	JUMP_FORWARD      '521'
+
+458	LOAD_FAST         'line'
+461	LOAD_FAST         'pos'
+464	BINARY_SUBSCR     None
+465	LOAD_CONST        '\t'
+468	COMPARE_OP        '=='
+471	POP_JUMP_IF_FALSE '495'
+
+474	LOAD_FAST         'column'
+477	LOAD_GLOBAL       'tabsize'
+480	BINARY_FLOOR_DIVIDE None
+481	LOAD_CONST        1
+484	BINARY_ADD        None
+485	LOAD_GLOBAL       'tabsize'
+488	BINARY_MULTIPLY   None
+489	STORE_FAST        'column'
+492	JUMP_FORWARD      '521'
+
+495	LOAD_FAST         'line'
+498	LOAD_FAST         'pos'
+501	BINARY_SUBSCR     None
+502	LOAD_CONST        '\x0c'
+505	COMPARE_OP        '=='
+508	POP_JUMP_IF_FALSE '520'
+
+511	LOAD_CONST        0
+514	STORE_FAST        'column'
+517	JUMP_FORWARD      '521'
+
+520	BREAK_LOOP        None
+521_0	COME_FROM         '455'
+521_1	COME_FROM         '492'
+521_2	COME_FROM         '517'
+
+521	LOAD_FAST         'pos'
+524	LOAD_CONST        1
+527	INPLACE_ADD       None
+528	STORE_FAST        'pos'
+531	JUMP_BACK         '417'
+534	POP_BLOCK         None
+535_0	COME_FROM         '414'
+
+535	LOAD_FAST         'pos'
+538	LOAD_FAST         'max'
+541	COMPARE_OP        '=='
+544	POP_JUMP_IF_FALSE '551'
+
+547	BREAK_LOOP        None
+548	JUMP_FORWARD      '551'
+551_0	COME_FROM         '548'
+
+551	LOAD_FAST         'line'
+554	LOAD_FAST         'pos'
+557	BINARY_SUBSCR     None
+558	LOAD_CONST        '#\r\n'
+561	COMPARE_OP        'in'
+564	POP_JUMP_IF_FALSE '773'
+
+567	LOAD_FAST         'line'
+570	LOAD_FAST         'pos'
+573	BINARY_SUBSCR     None
+574	LOAD_CONST        '#'
+577	COMPARE_OP        '=='
+580	POP_JUMP_IF_FALSE '705'
+
+583	LOAD_FAST         'line'
+586	LOAD_FAST         'pos'
+589	SLICE+1           None
+590	LOAD_ATTR         'rstrip'
+593	LOAD_CONST        '\r\n'
+596	CALL_FUNCTION_1   None
+599	STORE_FAST        'comment_token'
+
+602	LOAD_FAST         'pos'
+605	LOAD_GLOBAL       'len'
+608	LOAD_FAST         'comment_token'
+611	CALL_FUNCTION_1   None
+614	BINARY_ADD        None
+615	STORE_FAST        'nl_pos'
+
+618	LOAD_GLOBAL       'COMMENT'
+621	LOAD_FAST         'comment_token'
+
+624	LOAD_FAST         'lnum'
+627	LOAD_FAST         'pos'
+630	BUILD_TUPLE_2     None
+633	LOAD_FAST         'lnum'
+636	LOAD_FAST         'pos'
+639	LOAD_GLOBAL       'len'
+642	LOAD_FAST         'comment_token'
+645	CALL_FUNCTION_1   None
+648	BINARY_ADD        None
+649	BUILD_TUPLE_2     None
+652	LOAD_FAST         'line'
+655	BUILD_TUPLE_5     None
+658	YIELD_VALUE       None
+659	POP_TOP           None
+
+660	LOAD_GLOBAL       'NL'
+663	LOAD_FAST         'line'
+666	LOAD_FAST         'nl_pos'
+669	SLICE+1           None
+
+670	LOAD_FAST         'lnum'
+673	LOAD_FAST         'nl_pos'
+676	BUILD_TUPLE_2     None
+679	LOAD_FAST         'lnum'
+682	LOAD_GLOBAL       'len'
+685	LOAD_FAST         'line'
+688	CALL_FUNCTION_1   None
+691	BUILD_TUPLE_2     None
+694	LOAD_FAST         'line'
+697	BUILD_TUPLE_5     None
+700	YIELD_VALUE       None
+701	POP_TOP           None
+702	JUMP_BACK         '64'
+
+705	LOAD_GLOBAL       'NL'
+708	LOAD_GLOBAL       'COMMENT'
+711	BUILD_TUPLE_2     None
+714	LOAD_FAST         'line'
+717	LOAD_FAST         'pos'
+720	BINARY_SUBSCR     None
+721	LOAD_CONST        '#'
+724	COMPARE_OP        '=='
+727	BINARY_SUBSCR     None
+728	LOAD_FAST         'line'
+731	LOAD_FAST         'pos'
+734	SLICE+1           None
+
+735	LOAD_FAST         'lnum'
+738	LOAD_FAST         'pos'
+741	BUILD_TUPLE_2     None
+744	LOAD_FAST         'lnum'
+747	LOAD_GLOBAL       'len'
+750	LOAD_FAST         'line'
+753	CALL_FUNCTION_1   None
+756	BUILD_TUPLE_2     None
+759	LOAD_FAST         'line'
+762	BUILD_TUPLE_5     None
+765	YIELD_VALUE       None
+766	POP_TOP           None
+
+767	CONTINUE          '64'
+770	JUMP_FORWARD      '773'
+773_0	COME_FROM         '770'
+
+773	LOAD_FAST         'column'
+776	LOAD_FAST         'indents'
+779	LOAD_CONST        -1
+782	BINARY_SUBSCR     None
+783	COMPARE_OP        '>'
+786	POP_JUMP_IF_FALSE '841'
+
+789	LOAD_FAST         'indents'
+792	LOAD_ATTR         'append'
+795	LOAD_FAST         'column'
+798	CALL_FUNCTION_1   None
+801	POP_TOP           None
+
+802	LOAD_GLOBAL       'INDENT'
+805	LOAD_FAST         'line'
+808	LOAD_FAST         'pos'
+811	SLICE+2           None
+812	LOAD_FAST         'lnum'
+815	LOAD_CONST        0
+818	BUILD_TUPLE_2     None
+821	LOAD_FAST         'lnum'
+824	LOAD_FAST         'pos'
+827	BUILD_TUPLE_2     None
+830	LOAD_FAST         'line'
+833	BUILD_TUPLE_5     None
+836	YIELD_VALUE       None
+837	POP_TOP           None
+838	JUMP_FORWARD      '841'
+841_0	COME_FROM         '838'
+
+841	SETUP_LOOP        '987'
+844	LOAD_FAST         'column'
+847	LOAD_FAST         'indents'
+850	LOAD_CONST        -1
+853	BINARY_SUBSCR     None
+854	COMPARE_OP        '<'
+857	POP_JUMP_IF_FALSE '947'
+
+860	LOAD_FAST         'column'
+863	LOAD_FAST         'indents'
+866	COMPARE_OP        'not in'
+869	POP_JUMP_IF_FALSE '902'
+
+872	LOAD_GLOBAL       'IndentationError'
+
+875	LOAD_CONST        'unindent does not match any outer indentation level'
+
+878	LOAD_CONST        '<tokenize>'
+881	LOAD_FAST         'lnum'
+884	LOAD_FAST         'pos'
+887	LOAD_FAST         'line'
+890	BUILD_TUPLE_4     None
+893	CALL_FUNCTION_2   None
+896	RAISE_VARARGS_1   None
+899	JUMP_FORWARD      '902'
+902_0	COME_FROM         '899'
+
+902	LOAD_FAST         'indents'
+905	LOAD_CONST        -1
+908	SLICE+2           None
+909	STORE_FAST        'indents'
+
+912	LOAD_GLOBAL       'DEDENT'
+915	LOAD_CONST        ''
+918	LOAD_FAST         'lnum'
+921	LOAD_FAST         'pos'
+924	BUILD_TUPLE_2     None
+927	LOAD_FAST         'lnum'
+930	LOAD_FAST         'pos'
+933	BUILD_TUPLE_2     None
+936	LOAD_FAST         'line'
+939	BUILD_TUPLE_5     None
+942	YIELD_VALUE       None
+943	POP_TOP           None
+944	JUMP_BACK         '844'
+947	POP_BLOCK         None
+948_0	COME_FROM         '841'
+948	JUMP_FORWARD      '987'
+
+951	LOAD_FAST         'line'
+954	POP_JUMP_IF_TRUE  '981'
+
+957	LOAD_GLOBAL       'TokenError'
+960	LOAD_CONST        'EOF in multi-line statement'
+963	LOAD_FAST         'lnum'
+966	LOAD_CONST        0
+969	BUILD_TUPLE_2     None
+972	BUILD_TUPLE_2     None
+975	RAISE_VARARGS_2   None
+978	JUMP_FORWARD      '981'
+981_0	COME_FROM         '978'
+
+981	LOAD_CONST        0
+984	STORE_FAST        'continued'
+987_0	COME_FROM         '376'
+987_1	COME_FROM         '948'
+
+987	SETUP_LOOP        '1746'
+990	LOAD_FAST         'pos'
+993	LOAD_FAST         'max'
+996	COMPARE_OP        '<'
+999	POP_JUMP_IF_FALSE '1745'
+
+1002	LOAD_GLOBAL       'pseudoprog'
+1005	LOAD_ATTR         'match'
+1008	LOAD_FAST         'line'
+1011	LOAD_FAST         'pos'
+1014	CALL_FUNCTION_2   None
+1017	STORE_FAST        'pseudomatch'
+
+1020	LOAD_FAST         'pseudomatch'
+1023	POP_JUMP_IF_FALSE '1692'
+
+1026	LOAD_FAST         'pseudomatch'
+1029	LOAD_ATTR         'span'
+1032	LOAD_CONST        1
+1035	CALL_FUNCTION_1   None
+1038	UNPACK_SEQUENCE_2 None
+1041	STORE_FAST        'start'
+1044	STORE_FAST        'end'
+
+1047	LOAD_FAST         'lnum'
+1050	LOAD_FAST         'start'
+1053	BUILD_TUPLE_2     None
+1056	LOAD_FAST         'lnum'
+1059	LOAD_FAST         'end'
+1062	BUILD_TUPLE_2     None
+1065	LOAD_FAST         'end'
+1068	ROT_THREE         None
+1069	ROT_TWO           None
+1070	STORE_FAST        'spos'
+1073	STORE_FAST        'epos'
+1076	STORE_FAST        'pos'
+
+1079	LOAD_FAST         'start'
+1082	LOAD_FAST         'end'
+1085	COMPARE_OP        '=='
+1088	POP_JUMP_IF_FALSE '1097'
+
+1091	CONTINUE          '990'
+1094	JUMP_FORWARD      '1097'
+1097_0	COME_FROM         '1094'
+
+1097	LOAD_FAST         'line'
+1100	LOAD_FAST         'start'
+1103	LOAD_FAST         'end'
+1106	SLICE+3           None
+1107	LOAD_FAST         'line'
+1110	LOAD_FAST         'start'
+1113	BINARY_SUBSCR     None
+1114	ROT_TWO           None
+1115	STORE_FAST        'token'
+1118	STORE_FAST        'initial'
+
+1121	LOAD_FAST         'initial'
+1124	LOAD_FAST         'numchars'
+1127	COMPARE_OP        'in'
+1130	POP_JUMP_IF_TRUE  '1157'
+
+1133	LOAD_FAST         'initial'
+1136	LOAD_CONST        '.'
+1139	COMPARE_OP        '=='
+1142	POP_JUMP_IF_FALSE '1180'
+1145	LOAD_FAST         'token'
+1148	LOAD_CONST        '.'
+1151	COMPARE_OP        '!='
+1154_0	COME_FROM         '1130'
+1154_1	COME_FROM         '1142'
+1154	POP_JUMP_IF_FALSE '1180'
+
+1157	LOAD_GLOBAL       'NUMBER'
+1160	LOAD_FAST         'token'
+1163	LOAD_FAST         'spos'
+1166	LOAD_FAST         'epos'
+1169	LOAD_FAST         'line'
+1172	BUILD_TUPLE_5     None
+1175	YIELD_VALUE       None
+1176	POP_TOP           None
+1177	JUMP_ABSOLUTE     '1742'
+
+1180	LOAD_FAST         'initial'
+1183	LOAD_CONST        '\r\n'
+1186	COMPARE_OP        'in'
+1189	POP_JUMP_IF_FALSE '1233'
+
+1192	LOAD_FAST         'parenlev'
+1195	LOAD_CONST        0
+1198	COMPARE_OP        '>'
+1201	POP_JUMP_IF_FALSE '1210'
+1204	LOAD_GLOBAL       'NL'
+1207	JUMP_FORWARD      '1213'
+1210	LOAD_GLOBAL       'NEWLINE'
+1213_0	COME_FROM         '1207'
+
+1213	LOAD_FAST         'token'
+1216	LOAD_FAST         'spos'
+1219	LOAD_FAST         'epos'
+1222	LOAD_FAST         'line'
+1225	BUILD_TUPLE_5     None
+1228	YIELD_VALUE       None
+1229	POP_TOP           None
+1230	JUMP_ABSOLUTE     '1742'
+
+1233	LOAD_FAST         'initial'
+1236	LOAD_CONST        '#'
+1239	COMPARE_OP        '=='
+1242	POP_JUMP_IF_FALSE '1268'
+
+1245	LOAD_GLOBAL       'COMMENT'
+1248	LOAD_FAST         'token'
+1251	LOAD_FAST         'spos'
+1254	LOAD_FAST         'epos'
+1257	LOAD_FAST         'line'
+1260	BUILD_TUPLE_5     None
+1263	YIELD_VALUE       None
+1264	POP_TOP           None
+1265	JUMP_ABSOLUTE     '1742'
+
+1268	LOAD_FAST         'token'
+1271	LOAD_GLOBAL       'triple_quoted'
+1274	COMPARE_OP        'in'
+1277	POP_JUMP_IF_FALSE '1403'
+
+1280	LOAD_GLOBAL       'endprogs'
+1283	LOAD_FAST         'token'
+1286	BINARY_SUBSCR     None
+1287	STORE_FAST        'endprog'
+
+1290	LOAD_FAST         'endprog'
+1293	LOAD_ATTR         'match'
+1296	LOAD_FAST         'line'
+1299	LOAD_FAST         'pos'
+1302	CALL_FUNCTION_2   None
+1305	STORE_FAST        'endmatch'
+
+1308	LOAD_FAST         'endmatch'
+1311	POP_JUMP_IF_FALSE '1371'
+
+1314	LOAD_FAST         'endmatch'
+1317	LOAD_ATTR         'end'
+1320	LOAD_CONST        0
+1323	CALL_FUNCTION_1   None
+1326	STORE_FAST        'pos'
+
+1329	LOAD_FAST         'line'
+1332	LOAD_FAST         'start'
+1335	LOAD_FAST         'pos'
+1338	SLICE+3           None
+1339	STORE_FAST        'token'
+
+1342	LOAD_GLOBAL       'STRING'
+1345	LOAD_FAST         'token'
+1348	LOAD_FAST         'spos'
+1351	LOAD_FAST         'lnum'
+1354	LOAD_FAST         'pos'
+1357	BUILD_TUPLE_2     None
+1360	LOAD_FAST         'line'
+1363	BUILD_TUPLE_5     None
+1366	YIELD_VALUE       None
+1367	POP_TOP           None
+1368	JUMP_ABSOLUTE     '1689'
+
+1371	LOAD_FAST         'lnum'
+1374	LOAD_FAST         'start'
+1377	BUILD_TUPLE_2     None
+1380	STORE_FAST        'strstart'
+
+1383	LOAD_FAST         'line'
+1386	LOAD_FAST         'start'
+1389	SLICE+1           None
+1390	STORE_FAST        'contstr'
+
+1393	LOAD_FAST         'line'
+1396	STORE_FAST        'contline'
+
+1399	BREAK_LOOP        None
+1400	JUMP_ABSOLUTE     '1742'
+
+1403	LOAD_FAST         'initial'
+1406	LOAD_GLOBAL       'single_quoted'
+1409	COMPARE_OP        'in'
+1412	POP_JUMP_IF_TRUE  '1447'
+
+1415	LOAD_FAST         'token'
+1418	LOAD_CONST        2
+1421	SLICE+2           None
+1422	LOAD_GLOBAL       'single_quoted'
+1425	COMPARE_OP        'in'
+1428	POP_JUMP_IF_TRUE  '1447'
+
+1431	LOAD_FAST         'token'
+1434	LOAD_CONST        3
+1437	SLICE+2           None
+1438	LOAD_GLOBAL       'single_quoted'
+1441	COMPARE_OP        'in'
+1444_0	COME_FROM         '1412'
+1444_1	COME_FROM         '1428'
+1444	POP_JUMP_IF_FALSE '1563'
+
+1447	LOAD_FAST         'token'
+1450	LOAD_CONST        -1
+1453	BINARY_SUBSCR     None
+1454	LOAD_CONST        '\n'
+1457	COMPARE_OP        '=='
+1460	POP_JUMP_IF_FALSE '1540'
+
+1463	LOAD_FAST         'lnum'
+1466	LOAD_FAST         'start'
+1469	BUILD_TUPLE_2     None
+1472	STORE_FAST        'strstart'
+
+1475	LOAD_GLOBAL       'endprogs'
+1478	LOAD_FAST         'initial'
+1481	BINARY_SUBSCR     None
+1482	JUMP_IF_TRUE_OR_POP '1510'
+1485	LOAD_GLOBAL       'endprogs'
+1488	LOAD_FAST         'token'
+1491	LOAD_CONST        1
+1494	BINARY_SUBSCR     None
+1495	BINARY_SUBSCR     None
+1496	JUMP_IF_TRUE_OR_POP '1510'
+
+1499	LOAD_GLOBAL       'endprogs'
+1502	LOAD_FAST         'token'
+1505	LOAD_CONST        2
+1508	BINARY_SUBSCR     None
+1509	BINARY_SUBSCR     None
+1510_0	COME_FROM         '1482'
+1510_1	COME_FROM         '1496'
+1510	STORE_FAST        'endprog'
+
+1513	LOAD_FAST         'line'
+1516	LOAD_FAST         'start'
+1519	SLICE+1           None
+1520	LOAD_CONST        1
+1523	ROT_TWO           None
+1524	STORE_FAST        'contstr'
+1527	STORE_FAST        'needcont'
+
+1530	LOAD_FAST         'line'
+1533	STORE_FAST        'contline'
+
+1536	BREAK_LOOP        None
+1537	JUMP_ABSOLUTE     '1689'
+
+1540	LOAD_GLOBAL       'STRING'
+1543	LOAD_FAST         'token'
+1546	LOAD_FAST         'spos'
+1549	LOAD_FAST         'epos'
+1552	LOAD_FAST         'line'
+1555	BUILD_TUPLE_5     None
+1558	YIELD_VALUE       None
+1559	POP_TOP           None
+1560	JUMP_ABSOLUTE     '1742'
+
+1563	LOAD_FAST         'initial'
+1566	LOAD_FAST         'namechars'
+1569	COMPARE_OP        'in'
+1572	POP_JUMP_IF_FALSE '1598'
+
+1575	LOAD_GLOBAL       'NAME'
+1578	LOAD_FAST         'token'
+1581	LOAD_FAST         'spos'
+1584	LOAD_FAST         'epos'
+1587	LOAD_FAST         'line'
+1590	BUILD_TUPLE_5     None
+1593	YIELD_VALUE       None
+1594	POP_TOP           None
+1595	JUMP_ABSOLUTE     '1742'
+
+1598	LOAD_FAST         'initial'
+1601	LOAD_CONST        '\\'
+1604	COMPARE_OP        '=='
+1607	POP_JUMP_IF_FALSE '1619'
+
+1610	LOAD_CONST        1
+1613	STORE_FAST        'continued'
+1616	JUMP_ABSOLUTE     '1742'
+
+1619	LOAD_FAST         'initial'
+1622	LOAD_CONST        '([{'
+1625	COMPARE_OP        'in'
+1628	POP_JUMP_IF_FALSE '1644'
+
+1631	LOAD_FAST         'parenlev'
+1634	LOAD_CONST        1
+1637	INPLACE_ADD       None
+1638	STORE_FAST        'parenlev'
+1641	JUMP_FORWARD      '1669'
+
+1644	LOAD_FAST         'initial'
+1647	LOAD_CONST        ')]}'
+1650	COMPARE_OP        'in'
+1653	POP_JUMP_IF_FALSE '1669'
+
+1656	LOAD_FAST         'parenlev'
+1659	LOAD_CONST        1
+1662	INPLACE_SUBTRACT  None
+1663	STORE_FAST        'parenlev'
+1666	JUMP_FORWARD      '1669'
+1669_0	COME_FROM         '1641'
+1669_1	COME_FROM         '1666'
+
+1669	LOAD_GLOBAL       'OP'
+1672	LOAD_FAST         'token'
+1675	LOAD_FAST         'spos'
+1678	LOAD_FAST         'epos'
+1681	LOAD_FAST         'line'
+1684	BUILD_TUPLE_5     None
+1687	YIELD_VALUE       None
+1688	POP_TOP           None
+1689	JUMP_BACK         '990'
+
+1692	LOAD_GLOBAL       'ERRORTOKEN'
+1695	LOAD_FAST         'line'
+1698	LOAD_FAST         'pos'
+1701	BINARY_SUBSCR     None
+
+1702	LOAD_FAST         'lnum'
+1705	LOAD_FAST         'pos'
+1708	BUILD_TUPLE_2     None
+1711	LOAD_FAST         'lnum'
+1714	LOAD_FAST         'pos'
+1717	LOAD_CONST        1
+1720	BINARY_ADD        None
+1721	BUILD_TUPLE_2     None
+1724	LOAD_FAST         'line'
+1727	BUILD_TUPLE_5     None
+1730	YIELD_VALUE       None
+1731	POP_TOP           None
+
+1732	LOAD_FAST         'pos'
+1735	LOAD_CONST        1
+1738	INPLACE_ADD       None
+1739	STORE_FAST        'pos'
+1742	JUMP_BACK         '990'
+1745	POP_BLOCK         None
+1746_0	COME_FROM         '987'
+1746	JUMP_BACK         '64'
+1749	POP_BLOCK         None
+1750_0	COME_FROM         '61'
+
+1750	SETUP_LOOP        '1803'
+1753	LOAD_FAST         'indents'
+1756	LOAD_CONST        1
+1759	SLICE+1           None
+1760	GET_ITER          None
+1761	FOR_ITER          '1802'
+1764	STORE_FAST        'indent'
+
+1767	LOAD_GLOBAL       'DEDENT'
+1770	LOAD_CONST        ''
+1773	LOAD_FAST         'lnum'
+1776	LOAD_CONST        0
+1779	BUILD_TUPLE_2     None
+1782	LOAD_FAST         'lnum'
+1785	LOAD_CONST        0
+1788	BUILD_TUPLE_2     None
+1791	LOAD_CONST        ''
+1794	BUILD_TUPLE_5     None
+1797	YIELD_VALUE       None
+1798	POP_TOP           None
+1799	JUMP_BACK         '1761'
+1802	POP_BLOCK         None
+1803_0	COME_FROM         '1750'
+
+1803	LOAD_GLOBAL       'ENDMARKER'
+1806	LOAD_CONST        ''
+1809	LOAD_FAST         'lnum'
+1812	LOAD_CONST        0
+1815	BUILD_TUPLE_2     None
+1818	LOAD_FAST         'lnum'
+1821	LOAD_CONST        0
+1824	BUILD_TUPLE_2     None
+1827	LOAD_CONST        ''
+1830	BUILD_TUPLE_5     None
+1833	YIELD_VALUE       None
+1834	POP_TOP           None
+1835	LOAD_CONST        None
+1838	RETURN_VALUE      None
+
+Syntax error at or near `POP_BLOCK' token at offset 1749
+
+
+if __name__ == '__main__':
+    import sys
+    if len(sys.argv) > 1:
+        tokenize(open(sys.argv[1]).readline)
+    else:
+        tokenize(sys.stdin.readline)
