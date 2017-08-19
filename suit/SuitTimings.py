@@ -1,0 +1,9 @@
+# Fuck you Disyer. Stealing my fucking paypal. GET FUCKED: toontown.suit.SuitTimings
+dict = {}
+fromSky = 6.5
+toSky = 6.5
+victoryDance = 9.08
+fromSuitBuilding = 2.0
+toSuitBuilding = 2.5
+toToonBuilding = 2.5
+suitDeath = 7.5
